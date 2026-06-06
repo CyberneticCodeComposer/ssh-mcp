@@ -1,0 +1,71 @@
+{
+  "dxt_version": "0.1",
+  "name": "ssh-mcp",
+  "display_name": "SSH MCP",
+  "version": "0.11.0",
+  "description": "Run SSH commands on network equipment and Unix hosts through Claude — read-only by default, with env-gated write mode.",
+  "author": {
+    "name": "Eric Kenny"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/CyberneticCodeComposer/ssh-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CyberneticCodeComposer/ssh-mcp"
+  },
+  "keywords": ["ssh", "network", "automation", "scrapli", "mcp", "devops"],
+  "server": {
+    "type": "python",
+    "entry_point": "ssh_mcp/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--project", "${__dirname}", "ssh-mcp"],
+      "env": {
+        "SSH_MCP_USERNAME": "${user_config.ssh_username}",
+        "SSH_MCP_PASSWORD": "${user_config.ssh_password}",
+        "SSH_MCP_PRIVATE_KEY": "${user_config.ssh_private_key}",
+        "SSH_MCP_ENABLE_WRITE": "${user_config.enable_write}",
+        "SSH_MCP_HOST_KEY_POLICY": "${user_config.host_key_policy}"
+      }
+    }
+  },
+  "user_config": {
+    "ssh_username": {
+      "type": "string",
+      "title": "SSH username",
+      "description": "Username for the default credential profile.",
+      "required": true
+    },
+    "ssh_password": {
+      "type": "string",
+      "title": "SSH password",
+      "description": "Password for the default profile. Leave blank for key-only auth.",
+      "sensitive": true,
+      "required": false
+    },
+    "ssh_private_key": {
+      "type": "file",
+      "title": "SSH private key",
+      "description": "Optional path to a private key file for the default profile.",
+      "required": false
+    },
+    "enable_write": {
+      "type": "boolean",
+      "title": "Enable write mode",
+      "description": "Register the ssh_send_config tool, which applies configuration changes.",
+      "default": false
+    },
+    "host_key_policy": {
+      "type": "string",
+      "title": "Host-key policy",
+      "description": "tofu (accept-new, recommended), strict, or off.",
+      "default": "tofu"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+services:
+  ssh-mcp:
+    build: .
+    image: ssh-mcp:latest
+    platform: linux/amd64
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+    restart: unless-stopped
