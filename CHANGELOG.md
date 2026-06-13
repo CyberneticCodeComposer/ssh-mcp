@@ -5,6 +5,33 @@ at runtime through the `server://version` MCP resource — keep both in sync.
 This project follows [semantic versioning](https://semver.org/) loosely:
 minor bumps for any tool name, signature, or behavior change.
 
+## 0.12.0 — 2026-06-10
+
+Security hardening (audit pass), all of it narrowing the read surface or
+closing a leak:
+
+- **Denylist — line-separator injection.** The command splitter now treats
+  carriage return, vertical tab, and form feed as separators alongside
+  newline, so `show version\rreload` can no longer smuggle a destructive verb
+  past a leading benign command (a device reads CR as Enter).
+- **Denylist — redirection without a leading space.** `echo x>/etc/passwd`,
+  the `>|` clobber form, and fd-prefixed `2>file` now match the
+  output-redirection rule; the old pattern required a space before `>`, so the
+  no-space form was an arbitrary file write on generic/Linux hosts. Comparison
+  operators (`>=`, `=>`, `->`) are still allowed.
+- **Denylist — write/exfil pipe modifiers.** `show running-config | redirect
+  tftp://…` and `| append flash:…` are now rejected.
+- **Redaction — PEM private keys.** A multi-line `BEGIN/END … PRIVATE KEY`
+  block in device output is now masked; the per-line redactions could not span
+  lines, so an embedded key leaked in full.
+- **HTTP transport — unauthenticated `http_app`.** Serving the module-level
+  `http_app` directly (`uvicorn ssh_mcp.server:http_app`) bypassed the
+  `main()` token guard and exposed an unauthenticated SSH-executing endpoint.
+  Without `SSH_MCP_MCP_AUTH_TOKEN`, `http_app` now 503s every request.
+- **Defense in depth.** Credential fields (password, enable secret, key
+  passphrase, auth token) carry `repr=False` so a stray `repr()` can't leak
+  them; the audit log is created mode `0600`.
+
 ## 0.11.0 — 2026-05-22
 
 Opt-in audit logging (`SSH_MCP_AUDIT_LOG`): a FastMCP middleware writes one

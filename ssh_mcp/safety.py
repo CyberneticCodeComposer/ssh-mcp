@@ -65,6 +65,11 @@ _DENY: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     ("system shutdown", re.compile(r"^\s*shutdown\b", re.I)),
+    # IOS/NX-OS pipe modifiers that WRITE the output somewhere (`show run |
+    # redirect tftp://...`, `... | append flash:cfg`) — a write / exfil channel.
+    # (`| tee` is already caught by the filesystem-mutation rule after the
+    # split on `|`.)
+    ("output write via pipe modifier", re.compile(r"^\s*(redirect|append)\b", re.I)),
     (
         "service control",
         re.compile(
@@ -87,13 +92,22 @@ _DENY: list[tuple[str, re.Pattern[str]]] = [
             re.I,
         ),
     ),
-    ("output redirection", re.compile(r"(^|\s)>>?\s*[^\s|>]")),
+    # Output redirection to a file (`>`, `>>`, including the no-space form
+    # `cmd>file`, the `>|` clobber form, and fd-prefixed `2>file`). The
+    # lookbehind excludes the comparison/arrow operators `>=`, `=>`, `->`, and
+    # the lookahead excludes `>=`, so legitimate comparisons are not flagged.
+    # A bare leading-space requirement (the old `(^|\s)>`) let `echo x>/etc/foo`
+    # slip past — on a generic/Linux host that is an arbitrary file write.
+    ("output redirection", re.compile(r"(?<![=<>-])>>?(?![=>])")),
 ]
 
 # Split on shell/CLI separators AND on command-substitution delimiters
 # (backtick, parentheses) so `echo $(reload)` and `x `reload`` cannot smuggle a
-# destructive verb past a leading benign token.
-_SEGMENT_SPLIT = re.compile(r"[;|&\n`()]+")
+# destructive verb past a leading benign token. The separator set includes every
+# byte a terminal/CLI may treat as an end-of-line — newline, carriage return,
+# vertical tab, form feed — so `show version\rreload` cannot smuggle a second
+# command past the leading benign one (a device sees the CR as Enter).
+_SEGMENT_SPLIT = re.compile(r"[;|&\n\r\x0b\x0c`()]+")
 
 
 def check_read_only(command: str, extra_patterns: list[str] | None = None) -> str | None:
@@ -164,6 +178,14 @@ _REDACTIONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)(\b(?:pre-shared-key|psk)\b)\s+\S+"), r"\g<1> <REDACTED>"),
 ]
 
+# Multi-line PEM private-key blocks (RSA/EC/OPENSSH/ENCRYPTED/bare PRIVATE KEY).
+# The per-line _REDACTIONS above cannot catch these — the secret material spans
+# many lines — so a key embedded in a running-config or `show crypto` dump would
+# otherwise leak in full. The header/footer are kept so the line still reads.
+_PEM_PRIVATE_KEY = re.compile(
+    r"(?is)(-----BEGIN [A-Z0-9 ]*?PRIVATE KEY-----).*?(-----END [A-Z0-9 ]*?PRIVATE KEY-----)"
+)
+
 
 def redact(text: str) -> str:
     """Replace credential-bearing portions of device output with <REDACTED>.
@@ -175,7 +197,9 @@ def redact(text: str) -> str:
         for rx, repl in _REDACTIONS:
             line = rx.sub(repl, line)
         lines[i] = line
-    return "\n".join(lines)
+    joined = "\n".join(lines)
+    # Mask multi-line PEM private-key bodies after the per-line pass.
+    return _PEM_PRIVATE_KEY.sub(r"\g<1>\n<REDACTED>\n\g<2>", joined)
 
 
 # --- terminal-noise cleanup -----------------------------------------------

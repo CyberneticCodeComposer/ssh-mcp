@@ -47,10 +47,12 @@ class CredentialProfile:
 
     name: str
     username: str = ""
-    password: str = ""
-    enable_secret: str = ""
+    # Secret fields carry repr=False so a stray repr()/f-string of a profile or
+    # the Settings object (e.g. in a traceback or log line) cannot leak them.
+    password: str = field(default="", repr=False)
+    enable_secret: str = field(default="", repr=False)
     private_key: str = ""  # path to a private key file (~ is expanded)
-    private_key_passphrase: str = ""  # passphrase for an encrypted private key
+    private_key_passphrase: str = field(default="", repr=False)  # for an encrypted key
 
 
 @dataclass(frozen=True)
@@ -61,7 +63,7 @@ class Settings:
     timeout_socket: float
     timeout_ops: float
     denylist_extra: list[str] = field(default_factory=list)
-    mcp_auth_token: str = ""
+    mcp_auth_token: str = field(default="", repr=False)
     # Host-key verification: "tofu" (accept-new, default), "strict", or "off".
     host_key_policy: str = "tofu"
     # Optional connection allowlist (host globs / CIDRs); empty = allow all.

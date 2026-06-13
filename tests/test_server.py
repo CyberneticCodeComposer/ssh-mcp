@@ -120,6 +120,36 @@ def test_check_read_only_blocks_command_substitution():
     assert check_read_only("logger $(rm -rf /var)") is not None
 
 
+def test_check_read_only_blocks_line_separator_injection():
+    # A device treats CR / vertical-tab / form-feed as Enter too — a destructive
+    # verb after one must not ride past the leading benign command.
+    assert check_read_only("show version\rreload") is not None
+    assert check_read_only("show clock\rerase startup-config") is not None
+    assert check_read_only("show version\x0breload") is not None
+    assert check_read_only("show version\x0cwrite memory") is not None
+
+
+def test_check_read_only_blocks_redirection_without_space():
+    # Redirection writes a file on a generic/Linux host — the read tools must
+    # reject it even without the leading space the old pattern required.
+    assert check_read_only("echo pwned>/etc/cron.d/x") is not None
+    assert check_read_only("echo pwned>>/etc/passwd") is not None
+    assert check_read_only("cat /proc/cpuinfo 2>/tmp/x") is not None
+    assert check_read_only("echo pwned >| /etc/passwd") is not None
+    assert check_read_only("echo hi > /etc/hosts") is not None  # the with-space form too
+    # Comparison / arrow operators are NOT redirection and must still pass.
+    assert check_read_only("awk '$3 >= 5' /var/log/syslog") is None
+    assert check_read_only("show running-config | include ntp") is None
+
+
+def test_check_read_only_blocks_write_pipe_modifiers():
+    # IOS/NX-OS `| redirect` / `| append` write or exfiltrate the output.
+    assert check_read_only("show running-config | redirect tftp://10.0.0.9/cfg") is not None
+    assert check_read_only("show running-config | append flash:cfg.txt") is not None
+    # `| include` / `| begin` filters are read-only and must still pass.
+    assert check_read_only("show running-config | begin interface") is None
+
+
 def test_check_read_only_honours_extra_patterns():
     assert check_read_only("show forbidden-thing", ["forbidden-thing"]) is not None
     assert check_read_only("show interfaces", ["forbidden-thing"]) is None
@@ -137,6 +167,26 @@ def test_redact_key_ciphertext():
     assert "AQBapSECRETBLOB" not in out
     assert "<REDACTED>" in out
     assert "MyNtpSecret" not in redact("ntp key plaintext MyNtpSecret")
+
+
+def test_redact_masks_pem_private_key():
+    # A multi-line PEM private key embedded in device output (running-config,
+    # `show crypto`) must not leak — the per-line redactions can't catch it.
+    for label in ("RSA PRIVATE KEY", "OPENSSH PRIVATE KEY", "EC PRIVATE KEY", "PRIVATE KEY"):
+        text = (
+            f"crypto key dump\n-----BEGIN {label}-----\n"
+            "MIIEowIBAAKCAQEAsecretkeymaterialLINE1\n"
+            "secretkeymaterialLINE2deadbeef\n"
+            f"-----END {label}-----\ntrailing line"
+        )
+        out = redact(text)
+        assert "secretkeymaterialLINE1" not in out, f"{label} body leaked"
+        assert "secretkeymaterialLINE2deadbeef" not in out, f"{label} body leaked"
+        assert "<REDACTED>" in out
+        # The header/footer and surrounding context are preserved for readability.
+        assert f"-----BEGIN {label}-----" in out
+        assert f"-----END {label}-----" in out
+        assert "trailing line" in out
 
 
 def test_redact_real_aruba_cx_config_shapes():
@@ -574,6 +624,58 @@ def test_resolve_transport_allows_http_with_token(monkeypatch):
 def test_resolve_transport_stdio_default(monkeypatch):
     monkeypatch.delenv("MCP_TRANSPORT", raising=False)
     assert _resolve_transport() == "stdio"
+
+
+def test_http_app_refuses_to_serve_without_token(monkeypatch):
+    # `uvicorn ssh_mcp.server:http_app` must not expose an unauthenticated
+    # SSH-executing endpoint, even though it bypasses main()'s _resolve_transport
+    # guard. Without a token, http_app 503s every request instead.
+    from starlette.testclient import TestClient
+
+    from ssh_mcp.server import _build_http_app
+
+    monkeypatch.delenv("SSH_MCP_MCP_AUTH_TOKEN", raising=False)
+    app = _build_http_app(build_server(make_settings()))
+    client = TestClient(app)
+    for method, path in [("post", "/mcp"), ("get", "/health"), ("get", "/anything")]:
+        resp = getattr(client, method)(path)
+        assert resp.status_code == 503
+        assert "SSH_MCP_MCP_AUTH_TOKEN" in resp.text
+
+
+def test_http_app_real_when_token_present(monkeypatch):
+    # With a token configured, the real FastMCP app is exposed (not the refuser).
+    from ssh_mcp.server import _build_http_app
+
+    monkeypatch.setenv("SSH_MCP_MCP_AUTH_TOKEN", "a-real-token")
+    app = _build_http_app(build_server(make_settings()))
+    paths = [getattr(r, "path", None) for r in app.routes]
+    assert paths != ["/{path:path}"]  # not the single-route refuser
+    assert "/health" in paths  # the real app's custom routes are present
+
+
+def test_credentials_kept_out_of_repr():
+    # A stray repr()/f-string of a profile or Settings (e.g. in a traceback)
+    # must not disclose the password, enable secret, key passphrase, or token.
+    settings = Settings(
+        write_enabled=False,
+        credentials={
+            "default": CredentialProfile(
+                name="default",
+                username="u",
+                password="PWSECRET",
+                enable_secret="ENSECRET",
+                private_key_passphrase="PPSECRET",
+            )
+        },
+        known_hosts=None,
+        timeout_socket=15.0,
+        timeout_ops=30.0,
+        mcp_auth_token="TOKENSECRET",
+    )
+    blob = repr(settings) + repr(settings.credentials["default"])
+    for secret in ("PWSECRET", "ENSECRET", "PPSECRET", "TOKENSECRET"):
+        assert secret not in blob, f"{secret} leaked through repr()"
 
 
 # --- SSH key authentication tests ----------------------------------------
@@ -1087,6 +1189,22 @@ async def test_audit_log_redacts_commands(tmp_path):
     assert "SECRETAUDIT" not in body
     rec = json.loads(body.splitlines()[0])
     assert "<REDACTED>" in rec["commands"][0]
+
+
+def test_audit_sink_creates_file_mode_0600(tmp_path):
+    # The audit trail records infrastructure topology — it must not be created
+    # world-readable.
+    import os
+    import stat
+
+    from ssh_mcp.audit import make_audit_sink
+
+    log = tmp_path / "audit.jsonl"
+    sink = make_audit_sink(str(log))
+    assert sink is not None
+    sink({"tool": "ssh_run_command", "host": "sw1"})
+    mode = stat.S_IMODE(os.stat(log).st_mode)
+    assert mode == 0o600, f"audit log mode is {oct(mode)}, expected 0o600"
 
 
 async def test_audit_log_disabled_writes_nothing(tmp_path):

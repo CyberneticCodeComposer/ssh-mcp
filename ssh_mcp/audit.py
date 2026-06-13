@@ -11,6 +11,7 @@ is a trail of intent and result, not a transcript.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -49,7 +50,11 @@ def make_audit_sink(target: str | None) -> AuditSink | None:
 
     def _file_sink(record: dict) -> None:
         line = json.dumps(record, default=str)
-        with lock, open(target, "a", encoding="utf-8") as fh:
+        # os.open with mode 0o600 applies only when the file is created, so the
+        # audit trail (hostnames, platforms, redacted commands — infrastructure
+        # topology) is not left world-readable. O_APPEND keeps writes atomic.
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with lock, os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
 
     return _file_sink

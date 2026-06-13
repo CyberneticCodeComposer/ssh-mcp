@@ -114,11 +114,26 @@ def build_server(settings: Settings) -> FastMCP:
         try:
             version = importlib.metadata.version("ssh-mcp")
         except importlib.metadata.PackageNotFoundError:
-            version = "0.11.0"
+            version = "0.12.0"
         return {
             "version": version,
-            "last_updated": "2026-05-22",
+            "last_updated": "2026-06-10",
             "changelog": [
+                {
+                    "version": "0.12.0",
+                    "date": "2026-06-10",
+                    "change": "Security hardening (audit pass): the command "
+                    "splitter now treats CR / vertical-tab / form-feed as "
+                    "separators (blocks `show version\\rreload`); the "
+                    "output-redirection rule catches the no-space `cmd>file`, "
+                    "`>|`, and `2>file` forms (was an arbitrary file write on "
+                    "Linux hosts); `| redirect` / `| append` write-pipe "
+                    "modifiers are rejected; multi-line PEM private keys in "
+                    "device output are redacted; the module-level http_app "
+                    "503s without SSH_MCP_MCP_AUTH_TOKEN (was an "
+                    "unauthenticated SSH endpoint when served directly); "
+                    "credential fields are repr=False; audit log is mode 0600.",
+                },
                 {
                     "version": "0.11.0",
                     "date": "2026-05-22",
@@ -252,8 +267,40 @@ def build_server(settings: Settings) -> FastMCP:
 
 mcp = build_server(SETTINGS)
 
+
+def _build_http_app(server: FastMCP):
+    """ASGI app for an external server (uvicorn). Refuses to expose the real
+    SSH-executing app unless SSH_MCP_MCP_AUTH_TOKEN is set.
+
+    main() guards `mcp.run(transport=http)`, but the module-level `http_app`
+    is a natural `uvicorn ssh_mcp.server:http_app` target that would otherwise
+    bypass that guard and serve an UNAUTHENTICATED endpoint able to run SSH
+    commands on network gear. When no token is configured we return a tiny app
+    that 503s every request instead, so there is no unauthenticated path to the
+    tools regardless of how the module is served."""
+    if os.environ.get("SSH_MCP_MCP_AUTH_TOKEN", "").strip():
+        return server.http_app()
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    async def _refuse(_request):
+        return JSONResponse(
+            {
+                "error": "ssh-mcp HTTP transport requires SSH_MCP_MCP_AUTH_TOKEN. "
+                "An unauthenticated HTTP server can run SSH commands on your "
+                "network gear. Set the token and restart."
+            },
+            status_code=503,
+        )
+
+    return Starlette(
+        routes=[Route("/{path:path}", _refuse, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])]
+    )
+
+
 # ASGI app for uvicorn — created AFTER tools are registered.
-http_app = mcp.http_app()
+http_app = _build_http_app(mcp)
 
 
 _HTTP_TRANSPORTS = ("http", "streamable-http", "sse")

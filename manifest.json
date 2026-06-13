@@ -2,7 +2,7 @@
   "dxt_version": "0.1",
   "name": "ssh-mcp",
   "display_name": "SSH MCP",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Run SSH commands on network equipment and Unix hosts through Claude — read-only by default, with env-gated write mode.",
   "author": {
     "name": "Eric Kenny"
