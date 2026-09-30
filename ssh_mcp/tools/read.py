@@ -17,14 +17,18 @@ from ..connection import (
     SSHAuthError,
     SSHCommandError,
     SSHConnectError,
+    command_policy,
     execute,
+    is_unix_host,
     open_connection,
+    probe_reachable,
 )
 from ..safety import cap_output, check_read_only, redact, strip_terminal_noise
 from ._shared import (
     CommandResult,
     MultiCommandResult,
     ReachabilityResult,
+    check_vdom_supported,
     get_settings,
     resolve_profile,
 )
@@ -48,15 +52,30 @@ def register(mcp: FastMCP) -> None:
         timeout: Annotated[
             float | None, "Per-command timeout in seconds (overrides the default)"
         ] = None,
+        vdom: Annotated[
+            str | None,
+            "FortiOS only: the device context to run in — a VDOM name, or "
+            "'global'. On a multi-VDOM FortiGate most reads (`get system "
+            "interface`, `get system performance status`, `get system ha "
+            "status`, `get router info routing-table all`) are out of scope at "
+            "the top-level prompt and fail with 'command parse error' / "
+            "'Command fail. Return code -61'. The server performs the "
+            "`config global` / `config vdom` + `edit <name>` navigation itself. "
+            "Omit it to run at the top level (`get system status`, `show`) — "
+            "or, if your MCP client cannot omit an optional parameter, pass an "
+            "empty string, which means the same thing.",
+        ] = None,
     ) -> CommandResult:
         """Run one read-only CLI command on a network device or host over SSH.
 
         Use this to pull live diagnostic output — `show`/`display`/`get`
         commands on network gear, or read-only shell commands on Linux hosts.
         Do NOT use this to change configuration: state-changing commands are
-        rejected by the safety denylist — use `ssh_send_config` (write mode)
-        instead. For several commands on the same host, use `ssh_run_commands`
-        so the connection is opened once.
+        rejected — by a dangerous-command denylist on network gear, and by a
+        positive read-only allowlist on `linux`/`generic` Unix hosts (only
+        known-safe read commands run there). Use `ssh_send_config` (write mode)
+        for changes. For several commands on the same host, use
+        `ssh_run_commands` so the connection is opened once.
 
         Inputs: `host` (hostname/IP), `platform` (see slug list), `command`
         (one command; it must be non-destructive). Returns the device `output`
@@ -66,12 +85,22 @@ def register(mcp: FastMCP) -> None:
         switch) scope the command or apply a device-side filter (`| include`)
         when you do not need all of it."""
         settings = get_settings(ctx)
-        reason = check_read_only(command, settings.denylist_extra)
+        reason = check_read_only(
+            command,
+            settings.denylist_extra,
+            unix_host=is_unix_host(platform),
+            allow_extra=settings.unix_allow_extra,
+            policy=command_policy(platform),
+            allow_commands=settings.allow_commands,
+        )
         if reason:
             raise ToolError(reason)
+        vdom = check_vdom_supported(platform, vdom)
         profile = resolve_profile(settings, credential_profile)
 
-        async with open_connection(host, platform, profile, settings, port, timeout) as driver:
+        async with open_connection(
+            host, platform, profile, settings, port, timeout, context=vdom
+        ) as driver:
             resp = await execute(driver, command)
 
         return CommandResult(
@@ -81,6 +110,8 @@ def register(mcp: FastMCP) -> None:
             output=cap_output(redact(strip_terminal_noise(resp.result)), settings.max_output_bytes),
             failed=bool(resp.failed),
             elapsed_seconds=getattr(resp, "elapsed_time", None),
+            vdom=vdom,
+            note=getattr(resp, "note", None),
         )
 
     @mcp.tool(name="ssh_run_commands")
@@ -92,13 +123,27 @@ def register(mcp: FastMCP) -> None:
         credential_profile: Annotated[str, "Name of the configured credential profile"] = "default",
         port: Annotated[int, "SSH port"] = 22,
         timeout: Annotated[float | None, "Per-command timeout in seconds"] = None,
+        vdom: Annotated[
+            str | None,
+            "FortiOS only: the device context to run in — a VDOM name, or "
+            "'global'. On a multi-VDOM FortiGate most reads (`get system "
+            "interface`, `get system performance status`, `get system ha "
+            "status`, `get router info routing-table all`) are out of scope at "
+            "the top-level prompt and fail with 'command parse error' / "
+            "'Command fail. Return code -61'. The server performs the "
+            "`config global` / `config vdom` + `edit <name>` navigation itself. "
+            "Omit it to run at the top level (`get system status`, `show`) — "
+            "or, if your MCP client cannot omit an optional parameter, pass an "
+            "empty string, which means the same thing.",
+        ] = None,
     ) -> MultiCommandResult:
         """Run several read-only commands on one host over a single SSH session.
 
         Use this when collecting multiple `show`/diagnostic commands from the
         same device — it is faster and gentler on the device than repeated
         `ssh_run_command` calls. Do NOT use it for configuration changes
-        (denylist-enforced) — use `ssh_send_config`.
+        (rejected by the denylist on network gear / the read-only allowlist on
+        Unix hosts) — use `ssh_send_config`.
 
         Inputs: `host`, `platform`, `commands` (a list; every command must be
         non-destructive — if any one is denied, the whole call is rejected
@@ -110,13 +155,24 @@ def register(mcp: FastMCP) -> None:
         if not commands:
             raise ToolError("`commands` is empty — provide at least one command.")
         for cmd in commands:
-            reason = check_read_only(cmd, settings.denylist_extra)
+            reason = check_read_only(
+                cmd,
+                settings.denylist_extra,
+                unix_host=is_unix_host(platform),
+                allow_extra=settings.unix_allow_extra,
+                policy=command_policy(platform),
+                allow_commands=settings.allow_commands,
+            )
             if reason:
                 raise ToolError(reason)
+        vdom = check_vdom_supported(platform, vdom)
         profile = resolve_profile(settings, credential_profile)
 
         results: list[CommandResult] = []
-        async with open_connection(host, platform, profile, settings, port, timeout) as driver:
+        # The context is entered once for the whole batch, by open_connection.
+        async with open_connection(
+            host, platform, profile, settings, port, timeout, context=vdom
+        ) as driver:
             for cmd in commands:
                 try:
                     resp = await execute(driver, cmd)
@@ -130,6 +186,7 @@ def register(mcp: FastMCP) -> None:
                             output="",
                             failed=True,
                             error=str(exc),
+                            vdom=vdom,
                         )
                     )
                     break
@@ -144,6 +201,8 @@ def register(mcp: FastMCP) -> None:
                         ),
                         failed=bool(resp.failed),
                         elapsed_seconds=getattr(resp, "elapsed_time", None),
+                        vdom=vdom,
+                        note=getattr(resp, "note", None),
                     )
                 )
 
@@ -152,6 +211,7 @@ def register(mcp: FastMCP) -> None:
             platform=platform,
             failed=any(r.failed for r in results),
             results=results,
+            vdom=vdom,
         )
 
     @mcp.tool(name="ssh_check_reachable")
@@ -178,8 +238,7 @@ def register(mcp: FastMCP) -> None:
         settings = get_settings(ctx)
         profile = resolve_profile(settings, credential_profile)
         try:
-            async with open_connection(host, platform, profile, settings, port):
-                pass
+            await probe_reachable(host, platform, profile, settings, port)
         except SSHAuthError as exc:
             # The device answered on SSH — it is reachable; creds were rejected.
             return ReachabilityResult(

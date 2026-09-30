@@ -63,6 +63,12 @@ class Settings:
     timeout_socket: float
     timeout_ops: float
     denylist_extra: list[str] = field(default_factory=list)
+    # Extra lead-command tokens allowed by the Unix (linux/generic) read
+    # allowlist, on top of the built-in read-only set.
+    unix_allow_extra: list[str] = field(default_factory=list)
+    # Whole-command regexes exempted from every built-in read-only check, for
+    # per-fleet diagnostics the built-in rules read as state changes.
+    allow_commands: list[str] = field(default_factory=list)
     mcp_auth_token: str = field(default="", repr=False)
     # Host-key verification: "tofu" (accept-new, default), "strict", or "off".
     host_key_policy: str = "tofu"
@@ -142,6 +148,15 @@ def load_settings() -> Settings:
     extra = [
         p.strip() for p in os.environ.get("SSH_MCP_DENYLIST_EXTRA", "").split(",") if p.strip()
     ]
+    unix_allow_extra = [
+        p.strip() for p in os.environ.get("SSH_MCP_UNIX_ALLOW_EXTRA", "").split(",") if p.strip()
+    ]
+    # Newline-separated, not comma-separated: a regex may legitimately contain a
+    # comma (`\d{1,3}`), and splitting one in half would silently produce two
+    # patterns that match the wrong things.
+    allow_commands = [
+        p.strip() for p in os.environ.get("SSH_MCP_ALLOW_COMMANDS", "").splitlines() if p.strip()
+    ]
     known_hosts = os.environ.get("SSH_MCP_KNOWN_HOSTS", "").strip() or None
     policy = os.environ.get("SSH_MCP_HOST_KEY_POLICY", "").strip().lower() or "tofu"
     if policy not in ("tofu", "strict", "off"):
@@ -156,6 +171,8 @@ def load_settings() -> Settings:
         timeout_socket=_env_float("SSH_MCP_TIMEOUT_SOCKET", 15.0),
         timeout_ops=_env_float("SSH_MCP_TIMEOUT_OPS", 30.0),
         denylist_extra=extra,
+        unix_allow_extra=unix_allow_extra,
+        allow_commands=allow_commands,
         mcp_auth_token=os.environ.get("SSH_MCP_MCP_AUTH_TOKEN", "").strip(),
         host_key_policy=policy,
         allowed_hosts=allowed_hosts,

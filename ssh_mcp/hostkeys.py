@@ -9,7 +9,7 @@ in the known_hosts file passed to connect() — so the file (loaded by asyncssh)
 handles the steady-state "known and matches" case, and this override handles
 "new host" (accept + pin) and "changed key" (reject).
 
-Design lessons from a prior Go SSH collector's TOFU host-key callback:
+Design lessons from CANS internal/collector/ssh/client.go (tofuHostKeyCallback):
 append on first sight, fail hard on a mismatch, serialize concurrent appends.
 """
 

@@ -62,7 +62,24 @@ SERVER_INSTRUCTIONS = (
     "Rules:\n"
     "- Pass `host`, `platform` (slug — see the ssh://platforms resource), and a "
     "`credential_profile` name. Get host/platform from NetBox if unknown.\n"
-    "- The read tools reject state-changing commands via a safety denylist.\n"
+    "- The read tools reject state-changing commands: a denylist on network "
+    "gear, and a positive read-only allowlist on 'linux'/'generic' Unix hosts "
+    "and on FortiOS (only known-safe read commands run there).\n"
+    "- FortiOS ('fortios'/'fortinet'/'fortigate'): on a multi-VDOM FortiGate "
+    "most reads are out of scope at the top-level prompt and fail with "
+    "'command parse error' / 'Return code -61'. Pass `vdom` (a VDOM name, or "
+    "'global') and the server enters that context for you — never send "
+    "`config`/`edit` yourself, they are denied.\n"
+    "- `vdom` applies ONLY to FortiOS; on any other platform a VDOM name is "
+    "rejected before connecting. If your client cannot omit an optional "
+    "parameter, send `vdom` as an empty string — that means 'not supplied' and "
+    "is accepted on every platform.\n"
+    "- FortiOS diagnostics: `diagnose debug flow` (filter/show/trace) and the "
+    "`diagnose debug enable|disable|reset|duration` toggles are permitted — "
+    "disable debug when you are done, it costs CPU on a busy firewall. "
+    "`diagnose sniffer packet` requires an explicit packet count "
+    "(`... <intf> '<filter>' <verbose> <count>`); without one the capture "
+    "never terminates and the call times out with nothing to show.\n"
     "- All device output has credentials redacted before it is returned.\n"
     "- If ssh_send_config is absent, write mode is disabled — do not try to "
     "make changes through the read tools."
@@ -114,11 +131,84 @@ def build_server(settings: Settings) -> FastMCP:
         try:
             version = importlib.metadata.version("ssh-mcp")
         except importlib.metadata.PackageNotFoundError:
-            version = "0.12.0"
+            version = "0.15.0"
         return {
             "version": version,
-            "last_updated": "2026-06-10",
+            "last_updated": "2026-09-11",
             "changelog": [
+                {
+                    "version": "0.16.0",
+                    "date": "2026-09-15",
+                    "change": "`vdom` now accepts a placeholder meaning 'not "
+                    "supplied' — an empty, whitespace-only, 'null' or 'none' "
+                    "value is normalized to None at the tool boundary, in "
+                    "connection.enter_context, and in the shell's context "
+                    "navigation. This makes ssh_run_command / ssh_run_commands "
+                    "callable from MCP clients that transform the advertised "
+                    "schema, dropping the nullable `anyOf` and marking every "
+                    "defaulted parameter required: such a client demands "
+                    "`vdom`, every VDOM name a caller can type is truthy, and "
+                    "the server correctly rejects a named context on a "
+                    "platform that has none — so no call satisfied both and "
+                    "the read tools were uncallable on every non-FortiOS "
+                    "platform. The deny-before-connect check is unchanged for "
+                    "a real name, and a placeholder can never reach `config "
+                    "vdom` / `edit <name>`. No tool names or signatures "
+                    "changed.",
+                },
+                {
+                    "version": "0.15.0",
+                    "date": "2026-09-11",
+                    "change": "Diagnostic reads the safety policy used to "
+                    "over-block are now permitted. On FortiOS the read tools "
+                    "allow `diagnose debug flow` (filter / show / trace, plus "
+                    "the `diagnose debug enable|disable|reset|duration` "
+                    "toggles it needs to produce output) and `diagnose sniffer "
+                    "packet` when an explicit packet count bounds the capture; "
+                    "the unbounded sniffer form stays denied. A new "
+                    "SSH_MCP_ALLOW_COMMANDS (newline-separated whole-command "
+                    "regexes) lets an operator exempt per-fleet diagnostics on "
+                    "any platform from the built-in denylist, platform policy, "
+                    "and Unix allowlist; SSH_MCP_DENYLIST_EXTRA is evaluated "
+                    "first and still wins. No tool names or signatures changed.",
+                },
+                {
+                    "version": "0.14.0",
+                    "date": "2026-09-03",
+                    "change": "FortiGate/FortiOS support fixed end to end. "
+                    "FortiOS is now driven by the raw PTY shell path (slugs "
+                    "'fortios', 'fortinet', 'fortigate') instead of "
+                    "scrapli-community, whose driver could not even be "
+                    "constructed when a credential profile carried an enable "
+                    "secret, and whose session prep WRITES device config to "
+                    "disable the CLI pager. The read tools now enforce a "
+                    "positive FortiOS command policy (the `execute` tree is "
+                    "default-deny, `fnsysctl` is denied, `diagnose` mutations "
+                    "are denied), FortiOS device errors are reported as "
+                    "failures instead of successes, redaction covers FortiOS "
+                    "`ENC` secrets and multi-token values, a server-driven "
+                    "`vdom` parameter reaches per-VDOM and global scope on "
+                    "multi-VDOM devices, and ssh_check_reachable no longer "
+                    "depends on prompt detection.",
+                },
+                {
+                    "version": "0.13.0",
+                    "date": "2026-08-02",
+                    "change": "Read tools now enforce a positive allowlist on "
+                    "'linux'/'generic' Unix hosts instead of the denylist alone: "
+                    "the denylist is anchored to each segment's first token, so "
+                    "wrapper verbs (sudo, bash -c, exec, env, nohup, xargs) and "
+                    "interpreters (python -c, perl -e, sed -i, find -delete) "
+                    "slipped a state change past it — a denylist can't sandbox a "
+                    "general-purpose shell. Only known-safe read commands run on "
+                    "Unix hosts now; extend with SSH_MCP_UNIX_ALLOW_EXTRA. "
+                    "Network platforms (incl. the ArubaOS-Switch/ArubaOS shell) "
+                    "are unchanged. Added ip/systemctl/service/sysctl/journalctl/"
+                    "date/hostname/dmesg mutating-subcommand guards to the "
+                    "denylist, and package `download`/`fetch` verbs. HTTP bind "
+                    "now defaults to 127.0.0.1; set MCP_HOST=0.0.0.0 to bind all "
+                    "interfaces (the container image and docker-compose do).",
+                },
                 {
                     "version": "0.12.0",
                     "date": "2026-06-10",
@@ -325,7 +415,12 @@ def _resolve_transport() -> str:
 def main() -> None:
     transport = _resolve_transport()
     if transport in _HTTP_TRANSPORTS:
-        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        # Default to loopback so a local `MCP_TRANSPORT=http` run is not
+        # silently exposed on every interface. Containers / reverse-proxy
+        # deployments that need a wider bind set MCP_HOST=0.0.0.0 explicitly
+        # (the Dockerfile and docker-compose.yml do); rely on network scoping
+        # + SSH_MCP_MCP_AUTH_TOKEN, not the bind address, as the real control.
+        host = os.environ.get("MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("MCP_PORT", "8000"))
         mcp.run(transport="sse" if transport == "sse" else "http", host=host, port=port)
     else:

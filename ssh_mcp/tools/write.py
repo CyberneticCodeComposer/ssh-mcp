@@ -23,7 +23,10 @@ from ..connection import (
     open_connection,
 )
 from ..safety import cap_output, redact, strip_terminal_noise
-from ._shared import ConfigResult, get_settings, resolve_profile
+from ._shared import ConfigResult, check_vdom_supported, get_settings, resolve_profile
+
+# Platforms that persist configuration as it is applied, so `save` is a no-op.
+_COMMIT_ON_END = {"fortios", "fortinet", "fortigate"}
 
 _PLATFORM_HINT = (
     "Platform slug — one of: " + ", ".join(SUPPORTED_PLATFORMS) + ". "
@@ -44,6 +47,15 @@ def register(mcp: FastMCP) -> None:
         credential_profile: Annotated[str, "Name of the configured credential profile"] = "default",
         port: Annotated[int, "SSH port"] = 22,
         timeout: Annotated[float | None, "Per-command timeout in seconds"] = None,
+        vdom: Annotated[
+            str | None,
+            "FortiOS only: the device context to apply the configuration in — a "
+            "VDOM name, or 'global'. The server performs the `config global` / "
+            "`config vdom` + `edit <name>` navigation itself, so the commands "
+            "need not carry it. Omit it to apply at the top level — or, if "
+            "your MCP client cannot omit an optional parameter, pass an empty "
+            "string, which means the same thing.",
+        ] = None,
     ) -> ConfigResult:
         """Apply configuration changes to a device over SSH (write mode).
 
@@ -76,11 +88,14 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("Write mode is disabled (SSH_MCP_ENABLE_WRITE is not true).")
         if not config_commands:
             raise ToolError("`config_commands` is empty — provide at least one command.")
+        vdom = check_vdom_supported(platform, vdom)
         profile = resolve_profile(settings, credential_profile)
         slug = normalize_platform(platform)
 
         drop_note: str | None = None
-        async with open_connection(host, platform, profile, settings, port, timeout) as driver:
+        async with open_connection(
+            host, platform, profile, settings, port, timeout, context=vdom
+        ) as driver:
             if is_generic(platform):
                 # Heterogeneous: scrapli Response on the generic-driver path,
                 # ShellResponse on the raw-shell path. Both duck-type the same.
@@ -112,7 +127,13 @@ def register(mcp: FastMCP) -> None:
             note: str | None = drop_note
             if save and not failed:
                 save_cmd = SAVE_COMMANDS.get(slug)
-                if is_generic(platform):
+                if slug in _COMMIT_ON_END:
+                    note = (
+                        "FortiOS applies configuration as each block is closed "
+                        "with 'end' — there is no separate save step, so `save` "
+                        "was ignored. Ensure your commands close every block."
+                    )
+                elif is_generic(platform):
                     note = "save is not applicable to generic/linux hosts; ignored."
                 elif save_cmd is None:
                     note = (
@@ -145,4 +166,5 @@ def register(mcp: FastMCP) -> None:
             failed=failed,
             saved=saved,
             note=note,
+            vdom=vdom,
         )

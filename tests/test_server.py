@@ -23,6 +23,7 @@ from ssh_mcp.connection import (
     SSHError,
     UnsupportedPlatformError,
     execute,
+    is_unix_host,
     open_connection,
 )
 from ssh_mcp.safety import check_read_only, redact
@@ -153,6 +154,142 @@ def test_check_read_only_blocks_write_pipe_modifiers():
 def test_check_read_only_honours_extra_patterns():
     assert check_read_only("show forbidden-thing", ["forbidden-thing"]) is not None
     assert check_read_only("show interfaces", ["forbidden-thing"]) is None
+
+
+def test_is_unix_host():
+    assert is_unix_host("linux")
+    assert is_unix_host("generic")
+    # The ArubaOS banner shells live in _GENERIC_PLATFORMS but are network CLIs,
+    # NOT Unix shells — the allowlist must not apply to them.
+    assert not is_unix_host("aruba-os-switch")
+    assert not is_unix_host("aruba-os")
+    assert not is_unix_host("cisco-ios")
+
+
+def test_unix_allowlist_blocks_denylist_bypasses():
+    # Every one of these slipped past the denylist alone (lead-anchored), so on
+    # a Unix host they must now be rejected by the positive allowlist / the new
+    # mutating-subcommand guards.
+    bypasses = [
+        "sudo reboot",
+        "bash -c 'rm -rf /tmp/x'",
+        "sh -c reboot",
+        "exec reboot",
+        "env reboot",
+        "nohup reboot",
+        "time reboot",
+        "command reboot",
+        "xargs rm < list",
+        "python3 -c \"open('/etc/cron.d/x','w')\"",
+        "perl -e 'unlink \"/etc/hosts\"'",
+        "sed -i 's/x/y/' /etc/hosts",
+        "find / -name '*.log' -delete",
+        "cp /bin/sh /tmp/rootsh",
+        "ln -sf /etc/shadow /tmp/s",
+        "ip addr add 10.0.0.1/24 dev eth0",
+        "ip -6 route add default via fe80::1",
+        "ip link set eth0 down",
+        "ip netns exec ns reboot",
+        "sysctl -w net.ipv4.ip_forward=1",
+        "sysctl net.ipv4.ip_forward=1",
+        "systemctl stop sshd",
+        "systemctl --user stop foo",
+        "service nginx restart",
+        "journalctl --vacuum-size=1M",
+        "dmesg -C",
+        "date -s '2020-01-01'",
+        "hostname newname",
+    ]
+    for cmd in bypasses:
+        assert check_read_only(cmd, unix_host=True) is not None, f"should block: {cmd}"
+
+
+def test_unix_allowlist_allows_safe_reads():
+    reads = [
+        "cat /etc/os-release",
+        "grep -i version /etc/os-release",
+        "head -50 /var/log/messages | tail -20",
+        "ip addr show",
+        "ip -br link",
+        "ip route get 8.8.8.8",
+        "ip netns list",
+        "ss -tlnp",
+        "netstat -rn",
+        "df -h",
+        "du -sh /var",
+        "uptime",
+        "uname -a",
+        "ps aux",
+        "free -m",
+        "journalctl -u sshd --no-pager -n 100",
+        "systemctl status sshd",
+        "systemctl is-active sshd",
+        "service --status-all",
+        "sysctl net.ipv4.ip_forward",
+        "dig +short example.com",
+        "date",
+        "hostname -f",
+        "which python3",
+    ]
+    for cmd in reads:
+        assert check_read_only(cmd, unix_host=True) is None, f"should allow: {cmd}"
+
+
+def test_unix_allowlist_extra_extends():
+    assert check_read_only("tcpdump -c 1", unix_host=True) is not None
+    assert check_read_only("tcpdump -c 1", unix_host=True, allow_extra=["tcpdump"]) is None
+
+
+def test_unix_allowlist_does_not_affect_network_path():
+    # unix_host defaults to False, so the network/denylist behaviour is
+    # unchanged: `show`/`awk` etc. are still allowed (they are not Unix hosts).
+    assert check_read_only("show version") is None
+    assert check_read_only("display vlan") is None
+    assert check_read_only("awk '$3 >= 5' /var/log/syslog") is None
+    assert check_read_only("ip -br addr") is None
+    # ...but a Unix host would reject bare awk (not on the read allowlist).
+    assert check_read_only("awk '$3 >= 5' /var/log/syslog", unix_host=True) is not None
+
+
+def test_denylist_guards_apply_on_all_platforms():
+    # The new mutating-subcommand guards are in the denylist, so they fire even
+    # without unix_host=True (belt-and-suspenders for the network shells).
+    assert check_read_only("ip addr add 10.0.0.1/24 dev eth0") is not None
+    assert check_read_only("systemctl stop sshd") is not None
+    assert check_read_only("ip netns exec ns sh") is not None
+    # Read forms of the same tools stay allowed on the network path.
+    assert check_read_only("ip addr show") is None
+    assert check_read_only("systemctl status sshd") is None
+
+
+def test_unix_allowlist_blocks_second_order_mutation():
+    # Allowlisted read tools that carry a mutating side-door (write via file,
+    # batch mode, console/clock changes) must still be rejected on Unix hosts.
+    vectors = [
+        "ip route restore < /tmp/routes",
+        "ip -b /tmp/cmds",
+        "ip -batch /tmp/cmds",
+        "ip -force -batch /tmp/cmds",
+        "sysctl -p /tmp/evil.conf",
+        "sysctl --system",
+        "systemctl clean foo",
+        "systemctl freeze foo",
+        "date 010112002020",
+        "hostname -F /tmp/name",
+        "hostname -b newname",
+        "dmesg -n 1",
+        "dmesg -D",
+        "dmesg -C",
+    ]
+    for cmd in vectors:
+        assert check_read_only(cmd, unix_host=True) is not None, f"should block: {cmd}"
+
+
+def test_unix_allowlist_preserves_case_significant_read_flags():
+    # These differ from a write flag only by case (-f vs -F, -d vs -D) — the
+    # guards are case-scoped so the read form is NOT collateral-damaged.
+    for cmd in ["hostname -f", "hostname -A", "dmesg -d", "dmesg -e", "date +%s", "date -R"]:
+        assert check_read_only(cmd, unix_host=True) is None, f"should allow: {cmd}"
 
 
 def test_redact_strips_secrets():
@@ -522,8 +659,15 @@ def test_ssh_errors_are_tool_errors():
 
 
 async def test_check_reachable_success():
+    # ssh_check_reachable uses a bare SSH probe, not a platform driver: a
+    # healthy FortiGate used to report reachable=False purely because the
+    # generic driver's prompt pattern could not match "fgt1-p # ".
     mcp = build_server(make_settings())
-    with patch("ssh_mcp.tools.read.open_connection", fake_open_connection(FakeDriver())):
+
+    async def ok(*args, **kwargs):
+        return None
+
+    with patch("ssh_mcp.tools.read.probe_reachable", ok):
         async with Client(mcp) as client:
             result = await client.call_tool(
                 "ssh_check_reachable", {"host": "sw1", "platform": "linux"}
@@ -536,7 +680,11 @@ async def test_check_reachable_success():
 async def test_check_reachable_auth_failure():
     mcp = build_server(make_settings())
     exc = SSHAuthError("SSH authentication failed for sw1: bad creds.")
-    with patch("ssh_mcp.tools.read.open_connection", failing_open_connection(exc)):
+
+    async def boom(*args, **kwargs):
+        raise exc
+
+    with patch("ssh_mcp.tools.read.probe_reachable", boom):
         async with Client(mcp) as client:
             result = await client.call_tool(
                 "ssh_check_reachable", {"host": "sw1", "platform": "linux"}
@@ -551,7 +699,11 @@ async def test_check_reachable_auth_failure():
 async def test_check_reachable_unreachable():
     mcp = build_server(make_settings())
     exc = SSHConnectError("Could not connect to sw1:22: timed out.")
-    with patch("ssh_mcp.tools.read.open_connection", failing_open_connection(exc)):
+
+    async def boom(*args, **kwargs):
+        raise exc
+
+    with patch("ssh_mcp.tools.read.probe_reachable", boom):
         async with Client(mcp) as client:
             result = await client.call_tool(
                 "ssh_check_reachable", {"host": "sw1", "platform": "linux"}
@@ -1218,3 +1370,1156 @@ async def test_audit_log_disabled_writes_nothing(tmp_path):
                 {"host": "sw1", "platform": "cisco-iosxe", "command": "show version"},
             )
     assert not log.exists()  # no middleware registered → no audit file
+
+
+# --- FortiOS: redaction ---------------------------------------------------
+
+
+def test_redact_real_fortios_config_shapes():
+    """Redaction holds on the real FortiOS `show` line shapes. A single live
+    read of a FortiGate-2200E leaked 58 secrets in full: the generic password
+    rule's keyword list had no FortiOS `ENC`, there was no rule for bare
+    `passwd`/`secret`, and every rule ended in one `\\S+`. Secrets here are fake."""
+    config = "\n".join(
+        [
+            "            set password ENC FAKEencPASSWORD==",
+            "        set passwd ENC FAKEencPASSWD==",
+            "        set secret ENC FAKEencRADIUS==",
+            "            set key-string FAKEkeystring==",
+            "        set psksecret ENC FAKEpsk==",
+            "        set ppk-secret ENC FAKEppk==",
+            "    set auth-password-l1 ENC FAKEl1==",
+            "        set group-password ENC FAKEgrp==",
+            '        set private-key "FAKEprivkey"',
+            # A key we have never seen: the ENC value-shape rule must still catch it.
+            "        set futurekey-we-never-heard-of ENC FAKEfuture==",
+        ]
+    )
+    out = redact(config)
+    for secret in (
+        "FAKEencPASSWORD",
+        "FAKEencPASSWD",
+        "FAKEencRADIUS",
+        "FAKEkeystring",
+        "FAKEpsk",
+        "FAKEppk",
+        "FAKEl1",
+        "FAKEgrp",
+        "FAKEprivkey",
+        "FAKEfuture",
+    ):
+        assert secret not in out, f"{secret} leaked through redact()"
+    # The ENC marker survives so the line still reads as an encrypted value.
+    assert "ENC <REDACTED>" in out
+
+
+def test_redact_masks_whole_multi_token_secret():
+    """The bug class behind the leak: every rule ended in a single `\\S+`, so a
+    multi-token or quoted value survived as `set key-string <REDACTED> <blob>`."""
+    assert "BLOB" not in redact("                    set key-string LEADING BLOBrest MOREblob")
+    assert "BLOB" not in redact('set password "quoted BLOB secret"')
+    assert "BLOB" not in redact("key-string 7 LEADING BLOBrest")
+    assert "BLOB" not in redact("set psksecret ENC LEADING BLOBrest")
+
+
+def test_redact_does_not_over_redact_fortios_reads():
+    """Read-safe FortiOS keys that merely contain a secret word must survive."""
+    for line in (
+        "        set password-policy enable",
+        "    set password-expire-days 90",
+        "        set passwd-policy-status enable",
+        "    set secret-2fa disable",
+        "            set key-type rsa",
+        "        set keylife 86400",
+        "        set key-index 1",
+        "        set ip 10.0.0.1 255.255.255.0",
+        "        set status enable",
+        '        set comment "password rotation done"',
+    ):
+        assert "<REDACTED>" not in redact(line), f"over-redacted: {line}"
+
+
+def test_redact_fortios_get_and_diagnose_output_shapes():
+    """Secrets do not only appear in `show`'s `set <key> ENC ...` form. FortiOS
+    `get` emits `key : value` and `diagnose` is free-form; the `set`-anchored
+    rules missed both, leaking any ENC-marked or FortiOS-keyed secret surfaced
+    by a read-allowed `get`/`diagnose`. Secrets here are fake."""
+    lines = [
+        "psksecret: ENC FAKEencA",  # get, colon + ENC
+        "psksecret ENC FAKEencB",  # bare key + ENC
+        "ppk-secret ENC FAKEencD",  # hyphenated key + ENC
+        "key-string: ENC FAKEencE",  # get, colon + ENC
+        "        The tunnel PSK is ENC FAKEencFreeform",  # diagnose free-form
+        "psksecret : FAKEplainPSK",  # get, plaintext value
+        "ppk-secret: FAKEplainPPK",  # get, plaintext value
+    ]
+    for line in lines:
+        out = redact(line)
+        assert "FAKEenc" not in out and "FAKEplain" not in out, f"leaked: {line!r} -> {out!r}"
+
+
+def test_redact_get_form_does_not_over_redact():
+    """The `get`-shape rule must not fire on read-safe keys that merely contain a
+    secret word, in either `set` or `key : value` form."""
+    for line in (
+        "psksecret-status : enable",
+        "password-policy : enable",
+        "key-type : rsa",
+        "keylife : 86400",
+        "status : up",
+        "hostname : fgt-edge-01",
+    ):
+        assert "<REDACTED>" not in redact(line), f"over-redacted: {line}"
+
+
+def test_redact_preserves_config_following_single_token_secrets():
+    """No-over-redaction guard for grammars where meaningful config FOLLOWS the
+    secret on the same line."""
+    out = redact("snmp-server community FAKEcomm ro 99")
+    assert "FAKEcomm" not in out and "ro 99" in out
+    out = redact(
+        "radius-server host 192.0.2.11 key ciphertext FAKEkey "
+        "tracking enable clearpass-username api-dur"
+    )
+    assert "FAKEkey" not in out and "clearpass-username api-dur" in out
+
+
+# --- FortiOS: command policy ----------------------------------------------
+
+_FORTIOS_MUST_DENY = [
+    "execute reboot",
+    "execute shutdown",
+    "execute factoryreset",
+    "execute factoryreset2",
+    "execute formatlogdisk",
+    "execute restore config tftp cfg 192.0.2.1",
+    "execute backup config tftp cfg 192.0.2.1",
+    "execute ssh 192.0.2.1",
+    "execute telnet 192.0.2.1",
+    "execute disconnect-admin-session 1",
+    "execute log delete",
+    "execute vpn-sslvpn-tunnel-disconnect all",
+    "execute usb-disk format",
+    "execute update-now",
+    "execute batch start",
+    "execute date 2020-01-01",
+    # FortiOS accepts any unambiguous abbreviation.
+    "exe reboot",
+    "exec reboot",
+    "ex reboot",
+    "execut factoryreset",
+    "diagnose debug application ike -1",
+    # An abbreviation shorter than `diag` fails closed: it is absent from the
+    # lead allowlist, so it never reaches the debug-flow exemption.
+    "dia debug enable",
+    "diagnose test application httpsd 99",
+    "diagnose sniffer packet any icmp 4",
+    "diagnose sys session filter clear",
+    "diagnose sys ha reset-uptime",
+    # A busybox shell escape; denied by absence from the lead allowlist.
+    "fnsysctl cat /data/config",
+    "fnsysctl ls /",
+    "unset hostname",
+    "config global",
+    "config vdom",
+    "set hostname x",
+    "edit port1",
+    "end",
+    "abort",
+    # Smuggled second commands.
+    "show ; execute reboot",
+    "get system status\rexecute reboot",
+    "show | grep x ; fnsysctl ls /",
+]
+
+_FORTIOS_MUST_ALLOW = [
+    "get system status",
+    "show",
+    "show full-configuration",
+    "get system interface",
+    "get system performance status",
+    "get system ha status",
+    "get router info routing-table all",
+    "get hardware nic",
+    "get system console",
+    'show | grep "config vdom" -f -A1',
+    "get system status | grep Version",
+    "diagnose sys session stat",
+    "diagnose hardware deviceinfo nic port1",
+    "diagnose ip arp list",
+    "diagnose sys top",
+    "diagnose firewall iprope list",
+    "diagnose vpn tunnel list",
+    "diagnose debug crashlog read",
+    "diagnose debug info",
+    "diagnose netlink interface list",
+    "execute ping 8.8.8.8",
+    "execute ping6 2001:db8::1",
+    "execute traceroute 8.8.8.8",
+    "execute ping-options view-settings",
+    "execute dhcp lease-list",
+    "execute log display",
+    "execute date",
+    "execute sensor list",
+    "exe ping 8.8.8.8",
+    "exit",
+]
+
+
+def test_fortios_policy_blocks_state_changing_surface():
+    """FortiOS hides its whole state-changing surface behind `execute`, a second
+    token the first-token-anchored denylist never saw. Verified against a live
+    FortiGate: every one of these used to be ALLOWED by the read tools."""
+    for cmd in _FORTIOS_MUST_DENY:
+        assert check_read_only(cmd, policy="fortios") is not None, f"should block: {cmd}"
+
+
+def test_fortios_policy_allows_real_read_commands():
+    for cmd in _FORTIOS_MUST_ALLOW:
+        assert check_read_only(cmd, policy="fortios") is None, f"should allow: {cmd}"
+
+
+def test_fortios_policy_does_not_leak_onto_other_platforms():
+    """Without a policy, every other platform behaves exactly as before."""
+    assert check_read_only("show version") is None
+    assert check_read_only("display vlan") is None
+    assert check_read_only("show running-config") is None
+
+
+def test_unset_is_denied_on_every_platform():
+    # FortiOS's negation verb; inert on other platforms, so the rule is global.
+    assert check_read_only("unset hostname") is not None
+    assert check_read_only("unset hostname", policy="fortios") is not None
+
+
+def test_command_policy_resolves_fortios_aliases():
+    from ssh_mcp.connection import command_policy
+
+    for slug in ("fortios", "fortinet", "fortigate", "FortiOS"):
+        assert command_policy(slug) == "fortios"
+    for other in ("cisco-ios", "linux", "aruba-cx", None):
+        assert command_policy(other) is None
+
+
+# --- FortiOS: diagnostic exemptions ---------------------------------------
+
+# `diagnose debug flow` and `diagnose sniffer packet` are reads in intent but
+# writes in mechanism (they arm a filter and toggle an output stream), so the
+# fortios policy's mutation and sniffer deny rules rejected them. These are the
+# exempted forms — the ones that produce diagnostic output and nothing else.
+_FORTIOS_DIAGNOSTIC_ALLOW = [
+    "diagnose debug flow filter addr 10.1.2.3",
+    "diagnose debug flow filter port 443",
+    "diagnose debug flow filter vd root",
+    "diagnose debug flow filter clear",
+    "diag debug flow filter addr 10.1.2.3",
+    "diagnose debug flow show console enable",
+    "diagnose debug flow show function-name enable",
+    "diagnose debug flow show iprope disable",
+    "diagnose debug flow trace start 100",
+    "diagnose debug flow trace stop",
+    # The companion toggles — without `enable` an armed trace prints nothing,
+    # and without `disable`/`reset` a session cannot clean up after itself.
+    "diagnose debug enable",
+    "diagnose debug disable",
+    "diagnose debug reset",
+    "diagnose debug duration 30",
+    "diagnose sniffer packet any 'host 10.1.2.3 and port 443' 4 100",
+    'diagnose sniffer packet port1 "(host a or host b) and tcp" 4 20 a',
+    "diagnose sniffer packet any none 4 10",
+]
+
+_FORTIOS_DIAGNOSTIC_DENY = [
+    # No packet count: the capture never terminates, the op timeout kills the
+    # call, and the packets are lost — so the bounded form is the only one.
+    "diagnose sniffer packet any 'host 1.1.1.1' 4",
+    "diagnose sniffer packet any none 6",
+    "diagnose sniffer packet any icmp 4 10",  # unquoted filter
+    "diagnose debug flow trace start",  # unbounded trace
+    # Not exempted: floods a busy firewall's console.
+    "diagnose debug application ike -1",
+    # An exemption matches the WHOLE command, so nothing rides along behind it.
+    "diagnose debug flow filter addr 1.1.1.1 ; reload",
+    "diagnose debug flow filter addr 1.1.1.1 && execute reboot",
+    "diagnose debug enable ; execute factoryreset",
+    "diagnose sniffer packet any 'x `reload`' 4 10",
+    "diagnose sniffer packet any none 4 10 > /tmp/cap",
+]
+
+
+def test_fortios_allows_bounded_flow_debug_and_sniffer():
+    for cmd in _FORTIOS_DIAGNOSTIC_ALLOW:
+        assert check_read_only(cmd, policy="fortios") is None, f"should allow: {cmd}"
+
+
+def test_fortios_diagnostic_exemptions_stay_narrow():
+    for cmd in _FORTIOS_DIAGNOSTIC_DENY:
+        assert check_read_only(cmd, policy="fortios") is not None, f"should block: {cmd}"
+
+
+def test_fortios_exemptions_do_not_leak_onto_other_platforms():
+    """The exemptions live in the fortios policy, not the global denylist."""
+    assert check_read_only("diagnose debug enable") is None  # no policy: inert
+    assert check_read_only("diagnose debug enable", unix_host=True) is not None
+
+
+# --- operator command allowlist (SSH_MCP_ALLOW_COMMANDS) -------------------
+
+
+def test_allow_commands_exempts_from_the_global_denylist():
+    """Cisco `debug` is denied globally; a fleet that needs one form says so."""
+    cmd = "debug ip packet detail 101"
+    assert check_read_only(cmd) is not None
+    assert check_read_only(cmd, allow_commands=[r"^debug ip packet\b"]) is None
+
+
+def test_allow_commands_exempts_from_the_unix_allowlist_and_policy():
+    tcpdump = "tcpdump -i eth0 -c 10"
+    assert check_read_only(tcpdump, unix_host=True) is not None
+    allow = [r"^tcpdump\b.* -c \d+$"]
+    assert check_read_only(tcpdump, unix_host=True, allow_commands=allow) is None
+
+    forti = "execute usb-disk list"
+    assert check_read_only(forti, policy="fortios") is not None
+    allow = [r"^execute usb-disk list$"]
+    assert check_read_only(forti, policy="fortios", allow_commands=allow) is None
+
+
+def test_operator_denylist_beats_the_operator_allowlist():
+    """So a too-broad allow pattern can always be carved back out."""
+    assert (
+        check_read_only(
+            "debug ip packet",
+            extra_patterns=[r"debug ip packet"],
+            allow_commands=[r"^debug"],
+        )
+        is not None
+    )
+
+
+def test_allow_commands_fails_closed_on_an_invalid_regex():
+    assert check_read_only("reload", allow_commands=["(["]) is not None
+
+
+def test_allow_commands_loads_newline_separated_from_env(monkeypatch):
+    """Newline-separated, because a regex may contain a comma (`\\d{1,3}`)."""
+    monkeypatch.setenv("SSH_MCP_ALLOW_COMMANDS", "^tcpdump -c \\d{1,3}$\n^debug ip packet\n")
+    monkeypatch.setenv("SSH_MCP_USERNAME", "u")
+    monkeypatch.setenv("SSH_MCP_PASSWORD", "p")
+    from ssh_mcp.settings import load_settings
+
+    assert load_settings().allow_commands == [r"^tcpdump -c \d{1,3}$", r"^debug ip packet"]
+
+
+# --- FortiOS: platform wiring ---------------------------------------------
+
+
+def test_build_driver_resolves_every_platform_with_enable_secret():
+    """The regression guard for the FortiOS blocker: _build_driver must build
+    for every mapped slug even when the profile carries an enable secret.
+    fortinet_fortios's driver subclasses AsyncGenericDriver, which takes no
+    `auth_secondary` — passing it was a 100% TypeError at construction, before
+    a packet was sent. Looping every slug catches the next such platform."""
+    from ssh_mcp.connection import _NETWORK_PLATFORMS, _build_driver
+
+    settings = make_settings()
+    profile = CredentialProfile(name="d", username="u", password="p", enable_secret="ena")
+    for slug in _NETWORK_PLATFORMS:
+        assert _build_driver("h", slug, profile, settings, 22, 30.0) is not None
+
+
+def test_build_driver_drops_auth_secondary_for_generic_community_driver(monkeypatch):
+    import scrapli
+
+    calls: list[dict] = []
+
+    class FakeScrapli:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            if "auth_secondary" in kwargs:
+                raise TypeError(
+                    "AsyncGenericDriver.__init__() got an unexpected keyword "
+                    "argument 'auth_secondary'"
+                )
+
+    monkeypatch.setattr(scrapli, "AsyncScrapli", FakeScrapli)
+    from ssh_mcp.connection import _build_driver
+
+    profile = CredentialProfile(name="d", username="u", password="p", enable_secret="ena")
+    _build_driver("h", "cisco-iosxe", profile, make_settings(), 22, 30.0)
+    assert len(calls) == 2
+    assert "auth_secondary" in calls[0] and "auth_secondary" not in calls[1]
+
+
+def test_build_driver_propagates_unrelated_type_error(monkeypatch):
+    import scrapli
+
+    class FakeScrapli:
+        def __init__(self, **kwargs):
+            raise TypeError("boom")
+
+    monkeypatch.setattr(scrapli, "AsyncScrapli", FakeScrapli)
+    from ssh_mcp.connection import _build_driver
+
+    profile = CredentialProfile(name="d", username="u", password="p", enable_secret="ena")
+    with pytest.raises(TypeError, match="boom"):
+        _build_driver("h", "cisco-iosxe", profile, make_settings(), 22, 30.0)
+
+
+def test_fortios_slugs_are_shell_platforms_not_network():
+    from ssh_mcp.connection import (
+        _NETWORK_PLATFORMS,
+        _SHELL_PLATFORMS,
+        SUPPORTED_PLATFORMS,
+        is_generic,
+        is_unix_host,
+        supports_context,
+    )
+
+    for slug in ("fortios", "fortinet", "fortigate"):
+        assert slug in SUPPORTED_PLATFORMS
+        assert slug in _SHELL_PLATFORMS
+        assert slug not in _NETWORK_PLATFORMS
+        # No scrapli config mode -> the write tool sends config line by line.
+        assert is_generic(slug)
+        # NOT a Unix shell: it gets the denylist + FortiOS policy, not the
+        # Unix read allowlist.
+        assert not is_unix_host(slug)
+        assert supports_context(slug)
+
+
+# --- FortiOS: shell profile behaviour -------------------------------------
+
+
+def test_shell_profile_defaults_match_procurve():
+    """The guard that making shell.py platform-aware changed nothing for the
+    existing ArubaOS-Switch / ArubaOS platforms."""
+    from ssh_mcp.shell import _DEVICE_ERROR_MARKERS, _PROMPT_LINE, ShellProfile
+
+    d = ShellProfile()
+    assert d.paging_command == "no page"
+    assert d.device_error_markers == _DEVICE_ERROR_MARKERS
+    assert d.prompt_line is _PROMPT_LINE
+    assert d.prompt_tail is None
+    assert d.pager_tail is None
+    assert d.banner_accept is None
+    assert d.supports_context is False
+
+
+def test_shell_profiles_cover_every_shell_platform():
+    from ssh_mcp.connection import _SHELL_PLATFORMS
+    from ssh_mcp.shell import SHELL_PROFILES
+
+    assert set(SHELL_PROFILES) == _SHELL_PLATFORMS
+    # The three FortiOS aliases share one profile object.
+    assert SHELL_PROFILES["fortios"] is SHELL_PROFILES["fortinet"]
+    assert SHELL_PROFILES["fortios"] is SHELL_PROFILES["fortigate"]
+    assert SHELL_PROFILES["fortios"].paging_command == ""
+
+
+def test_shell_clean_trims_fortios_context_prompt():
+    from ssh_mcp.shell import SHELL_PROFILES, _clean
+
+    fortios = SHELL_PROFILES["fortios"]
+    raw = "fgt1-p (prod) # get system status\r\nVersion: v7.4.9\r\nfgt1-p (prod) # "
+    assert _clean(raw, "get system status", fortios) == "Version: v7.4.9"
+    # The default (ProCurve) profile does NOT know the parenthesised VDOM
+    # prompt — the two patterns are independent.
+    assert "fgt1-p (prod) #" in _clean(raw, "get system status")
+
+
+async def test_shell_send_command_flags_fortios_device_error():
+    """Live FortiOS errors used to come back failed=False, because the shell
+    path only knew ProCurve's markers."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    for err in (
+        "command parse error before 'interface'",
+        "Command fail. Return code -61",
+        "Unknown action 0",
+    ):
+        proc = FakeProcess([f"fgt1-p # get system interface\r\n{err}\r\nfgt1-p # "])
+        conn = ShellConnection(
+            FakeConn(), proc, command_timeout=2.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+        )
+        resp = await conn.send_command("get system interface")
+        assert resp.failed is True, err
+        # The same output on the default profile is NOT a failure — the markers
+        # are per-profile, not global.
+        proc2 = FakeProcess([f"sw1# show x\r\n{err}\r\nsw1# "])
+        conn2 = ShellConnection(FakeConn(), proc2, command_timeout=2.0, quiet=0.05)
+        assert (await conn2.send_command("show x")).failed is False
+
+
+async def test_shell_prompt_tail_ends_read_early():
+    """FortiOS reads end on the prompt rather than waiting out the quiet
+    window, so a large capture is not paced by quiet-time detection."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = FakeProcess(["fgt1-p # get system status\r\n", "Version: v7.4.9\r\n", "fgt1-p # "])
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=30.0, quiet=5.0, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("get system status")
+    assert resp.result == "Version: v7.4.9"
+    assert resp.elapsed_time < 1.0  # ended on the prompt, not the 5s quiet window
+
+
+async def test_shell_prompt_tail_ignores_split_echo():
+    """A chunk boundary landing on the echoed prompt BEFORE the command text
+    must not end the read with empty output."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = FakeProcess(["fgt1-p # ", "get system status\r\nVersion: v7.4.9\r\nfgt1-p # "])
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=30.0, quiet=5.0, profile=SHELL_PROFILES["fortios"]
+    )
+    assert (await conn.send_command("get system status")).result == "Version: v7.4.9"
+
+
+# --- FortiOS: the --More-- pager ------------------------------------------
+
+
+class PagedFakeStdout:
+    """Fake PTY stdout that withholds the page after a `--More--` prompt until
+    the pager is answered. The lab FortiGate has `set output standard`, so the
+    pager path cannot be exercised live — this fake is its only coverage."""
+
+    def __init__(self, pages, stdin):
+        self._pages = list(pages)
+        self._stdin = stdin
+        self._served = 0
+
+    async def read(self, _n):
+        await asyncio.sleep(0)
+        if not self._pages:
+            await asyncio.sleep(3600)
+            return ""
+        # A page that follows a pager prompt is withheld until a space arrives.
+        while self._served and self._stdin.writes.count(" ") < self._served:
+            await asyncio.sleep(0.01)
+        self._served += 1
+        return self._pages.pop(0)
+
+    def at_eof(self):
+        return False
+
+
+class PagedFakeProcess:
+    def __init__(self, pages):
+        self.stdin = FakeStdin()
+        self.stdout = PagedFakeStdout(pages, self.stdin)
+
+
+async def test_shell_pager_is_answered_and_output_is_complete():
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = PagedFakeProcess(
+        [
+            "fgt1-p # show\r\nline1\r\n--More--",
+            "\r\nline2\r\n--More--",
+            "\r\nline3\r\n--More--",
+            "\r\nline4\r\nfgt1-p # ",
+        ]
+    )
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=10.0, quiet=0.2, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("show")
+    assert proc.stdin.writes.count(" ") == 3  # one answer per pager prompt
+    for line in ("line1", "line2", "line3", "line4"):
+        assert line in resp.result
+    assert "More" not in resp.result  # the pager prompt itself is stripped
+    assert resp.failed is False
+
+
+async def test_shell_pager_strips_backspace_erase_residue():
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = PagedFakeProcess(
+        [
+            "fgt1-p # show\r\nheader\r\n--More--\x08\x08\x08\x08        \x08\x08",
+            "\r\nbody\r\nfgt1-p # ",
+        ]
+    )
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=10.0, quiet=0.2, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("show")
+    assert "header" in resp.result and "body" in resp.result
+    assert "More" not in resp.result and "\x08" not in resp.result
+
+
+async def test_shell_pager_hard_caps_iterations(monkeypatch):
+    import ssh_mcp.shell as shell_mod
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    monkeypatch.setattr(shell_mod, "_MAX_PAGER_PAGES", 3)
+    proc = PagedFakeProcess(["fgt1-p # show\r\nx\r\n--More--"] + ["\r\ny\r\n--More--"] * 50)
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=10.0, quiet=0.2, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("show")
+    assert proc.stdin.writes.count(" ") == 3
+    assert "q\n" in proc.stdin.writes
+    assert "pager exceeded" in resp.result
+
+
+async def test_shell_pager_not_answered_for_default_profile():
+    """ArubaOS/ProCurve disable the pager instead of answering it — unchanged."""
+    from ssh_mcp.shell import ShellConnection
+
+    proc = PagedFakeProcess(["sw1# show\r\nline1\r\n--More--"])
+    conn = ShellConnection(FakeConn(), proc, command_timeout=2.0, quiet=0.05)
+    await conn.send_command("show")
+    assert " " not in proc.stdin.writes
+
+
+async def test_shell_drain_banner_accepts_fortios_post_login_banner():
+    """FortiOS `set post-login-banner enable` prints "(Press 'a' to accept):",
+    which a bare newline does not dismiss. Also the regression guard that we
+    send NO paging command to FortiOS — its only pager-off is a config write."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = FakeProcess(["Authorized use only\r\n(Press 'a' to accept):", "\r\nfgt1-p # "])
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=2.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+    )
+    await conn.drain_banner()
+    assert proc.stdin.writes == ["\n", "a"]
+
+
+# --- FortiOS: VDOM context ------------------------------------------------
+
+
+class ScriptedFakeStdout:
+    """Fake PTY stdout that answers one scripted response per command written,
+    the way a real CLI does. (FakeStdout streams every chunk immediately, which
+    lets a single drain swallow several commands' worth of output.)"""
+
+    def __init__(self, responses, stdin):
+        self._responses = list(responses)
+        self._stdin = stdin
+        self._served = 0
+
+    async def read(self, _n):
+        # Wait until another command has been sent, then answer just that one.
+        while len(self._stdin.writes) <= self._served:
+            await asyncio.sleep(0.01)
+        self._served += 1
+        if self._responses:
+            return self._responses.pop(0)
+        return "fgt1-p # "
+
+    def at_eof(self):
+        return False
+
+
+class ScriptedFakeProcess:
+    def __init__(self, responses):
+        self.stdin = FakeStdin()
+        self.stdout = ScriptedFakeStdout(responses, self.stdin)
+
+
+def _fortios_shell(responses):
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = ScriptedFakeProcess(responses)
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=2.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+    )
+    return conn, proc
+
+
+_VDOM_LIST_REPLY = (
+    "config vdom\r\nedit root\r\n--\r\nedit prod\r\n"
+    "--\r\nedit test1\r\n--\r\nedit test2\r\nfgt1-p # "
+)
+
+
+async def test_shell_enter_context_global():
+    conn, proc = _fortios_shell(["fgt1-p # ", "fgt1-p # ", "fgt1-p (global) # "])
+    assert await conn.enter_context("global") == "global"
+    # to_top() first, so a half-open block never bleeds into the new context.
+    assert proc.stdin.writes == ["abort\n", "end\n", "config global\n"]
+
+
+async def test_shell_enter_context_vdom_validates_against_device():
+    conn, proc = _fortios_shell(
+        [
+            "fgt1-p # ",  # abort
+            "fgt1-p # ",  # end
+            _VDOM_LIST_REPLY,  # show | grep "config vdom" -f -A1
+            "fgt1-p (vdom) # ",  # config vdom
+            "fgt1-p (prod) # ",  # edit prod
+        ]
+    )
+    assert await conn.enter_context("prod") == "prod"
+    assert "config vdom\n" in proc.stdin.writes
+    assert "edit prod\n" in proc.stdin.writes
+
+
+async def test_shell_enter_context_unknown_vdom_never_creates_it():
+    """`config vdom` + `edit <unknown>` CREATES a VDOM, so the name is resolved
+    against the device's real list BEFORE any `config vdom` is sent."""
+    conn, proc = _fortios_shell(["fgt1-p # ", "fgt1-p # ", _VDOM_LIST_REPLY])
+    with pytest.raises(ToolError) as exc:
+        await conn.enter_context("nosuchvdom")
+    assert "prod" in str(exc.value) and "test1" in str(exc.value)
+    assert "config vdom\n" not in proc.stdin.writes
+
+
+async def test_shell_enter_context_rejects_injection():
+    """The `vdom` value is written to the channel as `edit <name>`, so a
+    separator in it would smuggle a command past check_read_only entirely."""
+    for bad in (
+        "root\nexecute reboot",
+        "root; execute reboot",
+        "root global",
+        "root|grep",
+        "root`reboot`",
+        "root$(reboot)",
+        "",
+        "a" * 32,
+        "../x",
+    ):
+        conn, proc = _fortios_shell(["fgt1-p # "])
+        with pytest.raises(ToolError):
+            await conn.enter_context(bad)
+        assert proc.stdin.writes == [], f"wrote to the channel for {bad!r}"
+
+
+async def test_shell_enter_context_rejects_single_vdom_device():
+    conn, _ = _fortios_shell(["fgt1-p # ", "fgt1-p # ", "fgt1-p # "])
+    with pytest.raises(ToolError, match="not running in multi-VDOM mode"):
+        await conn.enter_context("root")
+
+
+async def test_run_command_rejects_vdom_on_non_fortios_platform():
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", fake_open_connection(FakeDriver())):
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="only supported on FortiOS"):
+                await client.call_tool(
+                    "ssh_run_command",
+                    {
+                        "host": "sw1",
+                        "platform": "cisco-ios",
+                        "command": "show version",
+                        "vdom": "prod",
+                    },
+                )
+
+
+async def test_run_commands_enters_context_once_for_the_batch():
+    captured: dict = {}
+
+    class ContextDriver(FakeDriver):
+        async def enter_context(self, ctx):
+            captured.setdefault("calls", []).append(ctx)
+            return ctx
+
+    driver = ContextDriver()
+
+    def capturing_open(*args, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return fake_open_connection(driver)(*args, **kwargs)
+
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", capturing_open):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "ssh_run_commands",
+                {
+                    "host": "fw1",
+                    "platform": "fortios",
+                    "commands": ["get system status", "get system interface", "show"],
+                    "vdom": "prod",
+                },
+            )
+    assert captured["context"] == "prod"
+    assert result.structured_content["vdom"] == "prod"
+
+
+# --- `vdom`: a placeholder value means "not supplied" ---------------------
+#
+# A client that transforms the advertised schema — stripping the `anyOf` and
+# marking every defaulted parameter required — leaves the caller unable to omit
+# an optional parameter. Every VDOM name a caller can type is truthy, so
+# without a placeholder the read tools become uncallable on every platform that
+# has no device contexts: the client demands `vdom` and the server rejects
+# every value it can send. These tests pin the escape hatch.
+
+
+def test_normalize_context_treats_placeholders_as_not_supplied():
+    from ssh_mcp.safety import normalize_context
+
+    for blank in (None, "", "   ", "\t", "null", "NULL", "none", "None", "  none  "):
+        assert normalize_context(blank) is None, f"{blank!r} should mean 'not supplied'"
+    # A real name survives, stripped; a name that merely CONTAINS a placeholder
+    # is untouched.
+    assert normalize_context("prod") == "prod"
+    assert normalize_context("  prod  ") == "prod"
+    assert normalize_context("global") == "global"
+    assert normalize_context("nonemgmt") == "nonemgmt"
+
+
+def test_check_vdom_supported_returns_normalized_value():
+    """The helper is the tool boundary: it must hand back the normalized value,
+    because callers pass the result to open_connection AND echo it back."""
+    from ssh_mcp.tools._shared import check_vdom_supported
+
+    assert check_vdom_supported("cisco-iosxe", "") is None
+    assert check_vdom_supported("cisco-iosxe", "  ") is None
+    assert check_vdom_supported("cisco-iosxe", "null") is None
+    assert check_vdom_supported("fortios", "  prod  ") == "prod"
+    # The deny-before-connect check itself is unchanged for a real name.
+    with pytest.raises(ToolError, match="only supported on FortiOS"):
+        check_vdom_supported("cisco-iosxe", "root")
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "null", "none"])
+async def test_run_command_accepts_placeholder_vdom_on_non_fortios(blank):
+    """The deadlock case: a client that cannot omit `vdom` must still be able
+    to run a command on a platform that has no device contexts."""
+    captured: dict = {}
+
+    def capturing_open(*args, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return fake_open_connection(FakeDriver(command_result="*11:44:02.123 EDT"))(*args, **kwargs)
+
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", capturing_open):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "ssh_run_command",
+                {
+                    "host": "sw1",
+                    "platform": "cisco-iosxe",
+                    "command": "show clock",
+                    "vdom": blank,
+                },
+            )
+    assert result.structured_content["failed"] is False
+    assert "11:44:02" in result.structured_content["output"]
+    # No context requested, so none is entered and none is claimed back.
+    assert captured["context"] is None
+    assert result.structured_content["vdom"] is None
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "null", "none"])
+async def test_run_commands_accepts_placeholder_vdom_on_non_fortios(blank):
+    captured: dict = {}
+
+    def capturing_open(*args, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return fake_open_connection(FakeDriver())(*args, **kwargs)
+
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", capturing_open):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "ssh_run_commands",
+                {
+                    "host": "sw1",
+                    "platform": "aruba-cx",
+                    "commands": ["show version", "show clock"],
+                    "vdom": blank,
+                },
+            )
+    assert result.structured_content["failed"] is False
+    assert captured["context"] is None
+    assert result.structured_content["vdom"] is None
+    assert all(r["vdom"] is None for r in result.structured_content["results"])
+
+
+async def test_send_config_accepts_placeholder_vdom_on_non_fortios():
+    captured: dict = {}
+
+    def capturing_open(*args, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return fake_open_connection(FakeDriver())(*args, **kwargs)
+
+    mcp = build_server(make_settings(write_enabled=True))
+    with patch("ssh_mcp.tools.write.open_connection", capturing_open):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "ssh_send_config",
+                {
+                    "host": "sw1",
+                    "platform": "cisco-iosxe",
+                    "config_commands": ["interface Gi1/0/1", "description uplink"],
+                    "confirm": "yes",
+                    "vdom": "",
+                },
+            )
+    assert result.structured_content["failed"] is False
+    assert captured["context"] is None
+    assert result.structured_content["vdom"] is None
+
+
+@pytest.mark.parametrize("real", ["root", "prod", "global"])
+async def test_run_command_still_rejects_a_real_vdom_on_non_fortios(real):
+    """The deny-before-connect check must NOT be weakened: a named context on a
+    platform with no contexts is still a hard error."""
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", fake_open_connection(FakeDriver())):
+        async with Client(mcp) as client:
+            for tool, extra in (
+                ("ssh_run_command", {"command": "show version"}),
+                ("ssh_run_commands", {"commands": ["show version"]}),
+            ):
+                with pytest.raises(ToolError, match="only supported on FortiOS"):
+                    await client.call_tool(
+                        tool,
+                        {"host": "sw1", "platform": "cisco-iosxe", "vdom": real, **extra},
+                    )
+
+
+async def test_run_command_on_fortios_still_navigates_a_real_vdom():
+    """FortiOS VDOM navigation is unchanged: a real name is passed through to
+    the connection, entered, and echoed back."""
+    captured: dict = {}
+
+    class ContextDriver(FakeDriver):
+        async def enter_context(self, ctx):
+            captured.setdefault("entered", []).append(ctx)
+            return ctx
+
+    def capturing_open(*args, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return fake_open_connection(ContextDriver(command_result="vdom output"))(*args, **kwargs)
+
+    mcp = build_server(make_settings())
+    with patch("ssh_mcp.tools.read.open_connection", capturing_open):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "ssh_run_command",
+                {
+                    "host": "fw1",
+                    "platform": "fortios",
+                    "command": "get system interface",
+                    # Surrounding whitespace is stripped, not treated as blank.
+                    "vdom": "  prod  ",
+                },
+            )
+    assert captured["context"] == "prod"
+    assert result.structured_content["vdom"] == "prod"
+    assert result.structured_content["failed"] is False
+
+
+async def test_enter_context_noop_for_placeholder_on_a_driver_without_contexts():
+    """connection.enter_context is the single gate in front of every driver's
+    navigation. A placeholder must be a no-op there — NOT the 'only supported
+    on FortiOS' error, which is what made the deadlock inescapable."""
+    from ssh_mcp.connection import enter_context
+
+    class NoContextDriver:
+        pass
+
+    for blank in (None, "", "   ", "null", "none"):
+        assert await enter_context(NoContextDriver(), blank) is None
+    # A real name on a driver with no context support is still an error.
+    with pytest.raises(ToolError, match="only supported on FortiOS"):
+        await enter_context(NoContextDriver(), "root")
+
+
+async def test_shell_enter_context_rejects_placeholders_without_touching_device():
+    """A placeholder reaching the shell layer is a caller bug, so it must fail
+    before any device round-trip — `config vdom` + `edit <name>` CREATES a VDOM
+    and must never be reachable with a blank name."""
+    for blank in ("", "   ", "null", "none"):
+        conn, proc = _fortios_shell(["fgt1-p # "])
+        with pytest.raises(ToolError, match="Invalid vdom"):
+            await conn.enter_context(blank)
+        assert proc.stdin.writes == [], f"wrote to the channel for {blank!r}"
+
+
+# --- FortiOS: the narrow fnsysctl /proc carve-out -------------------------
+
+
+def test_fortios_allows_fnsysctl_proc_reads():
+    """`fnsysctl` is a busybox shell escape and is denied in general, but some
+    counters have no CLI equivalent at all — the IPv6 RA/RS counters in
+    /proc/net/snmp6 are reachable no other way."""
+    for cmd in (
+        "fnsysctl cat /proc/net/snmp6",
+        "fnsysctl cat /proc/net/dev",
+        "fnsysctl cat /proc/net/if_inet6",
+        "fnsysctl cat /proc/meminfo",
+        "fnsysctl ls /proc",
+        "fnsysctl ls /proc/",
+        "fnsysctl ls /proc/net",
+        "fnsysctl cat /proc/net/snmp6 | grep Router",
+    ):
+        assert check_read_only(cmd, policy="fortios") is None, f"should allow: {cmd}"
+
+
+def test_fortios_fnsysctl_carve_out_cannot_escape_proc():
+    """The carve-out is the only busybox surface exposed, so it must not be
+    escapable. `..` is an ordinary member of a path charset — without an
+    explicit guard, `/proc/../data/config` reads the whole configuration."""
+    for cmd in (
+        "fnsysctl cat /proc/../data/config",
+        "fnsysctl cat /proc/../../data/config",
+        "fnsysctl cat /proc/./../data/config",
+        "fnsysctl ls /proc/..",
+        "fnsysctl cat /data/config",
+        "fnsysctl ls /",
+        "fnsysctl rm /proc/x",
+        "fnsysctl tail /proc/net/dev",
+        "fnsysctl cat /proc/net/snmp6 /data/config",
+        "fnsysctl cat /proc/net/snmp6 ; execute reboot",
+        "fnsysctl cat /proc/net/snmp6 > /tmp/x",
+        "fnsysctl",
+        "fnsysctl cat",
+    ):
+        assert check_read_only(cmd, policy="fortios") is not None, f"should block: {cmd}"
+
+
+def test_fnsysctl_escape_is_denied_on_every_platform():
+    """Mislabelling a FortiGate as another platform must not hand back an
+    unrestricted shell — the FortiOS policy would not be applied at all, so the
+    dangerous forms are denied globally. Only the safe /proc read survives."""
+    assert check_read_only("fnsysctl cat /data/config") is not None
+    assert check_read_only("fnsysctl ls /") is not None
+    assert check_read_only("fnsysctl cat /proc/../data/config") is not None
+    # The safe form stays allowed even without the policy — it is a plain read.
+    assert check_read_only("fnsysctl cat /proc/net/snmp6") is None
+
+
+# --- empty-output diagnostics --------------------------------------------
+
+
+async def test_shell_notes_full_screen_command_with_no_printable_output():
+    """A read that returns nothing is otherwise indistinguishable from a
+    command that legitimately prints nothing. `diagnose sys top` renders with
+    terminal control sequences and never returns to a prompt."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    esc = "\x1b[2J\x1b[H\x1b[1;1H\x1b[0m"
+    proc = FakeProcess([f"fgt1-p # diagnose sys top\r\n{esc}"])
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=2.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("diagnose sys top")
+    assert resp.result == ""
+    assert resp.note is not None
+    assert "control sequences" in resp.note
+
+
+async def test_shell_notes_completely_silent_command():
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = FakeProcess([""], eof_after=False)
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=1.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("diagnose sys pstack 1")
+    assert resp.result == ""
+    assert resp.note is not None and "no output at all" in resp.note
+
+
+async def test_shell_no_note_when_output_is_present():
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    proc = FakeProcess(["fgt1-p # get system status\r\nVersion: v7.4.9\r\nfgt1-p # "])
+    conn = ShellConnection(
+        FakeConn(), proc, command_timeout=2.0, quiet=0.05, profile=SHELL_PROFILES["fortios"]
+    )
+    resp = await conn.send_command("get system status")
+    assert resp.result == "Version: v7.4.9"
+    assert resp.note is None
+
+
+def test_fortios_quiet_window_exceeds_default():
+    """The quiet window is only reached when the device never returns a prompt
+    (prompt_tail ends every normal read), so FortiOS can afford a generous one
+    — at 1.5s a slow-starting command returned empty."""
+    from ssh_mcp.shell import SHELL_PROFILES, ShellProfile
+
+    assert SHELL_PROFILES["fortios"].quiet > ShellProfile().quiet
+    # ArubaOS platforms keep the original window.
+    assert SHELL_PROFILES["aruba-os"].quiet == ShellProfile().quiet
+
+
+# --- FortiOS: continuously-refreshing commands ----------------------------
+
+
+class BurstyFakeStdout:
+    """Emits chunks with a real pause between them — a periodic refresher such
+    as `diagnose sys top`, which never returns to a prompt."""
+
+    def __init__(self, chunks, gap):
+        self._chunks = list(chunks)
+        self._gap = gap
+        self._first = True
+
+    async def read(self, _n):
+        if not self._first:
+            await asyncio.sleep(self._gap)
+        self._first = False
+        if self._chunks:
+            return self._chunks.pop(0)
+        await asyncio.sleep(3600)
+        return ""
+
+    def at_eof(self):
+        return False
+
+
+class BurstyFakeProcess:
+    def __init__(self, chunks, gap):
+        self.stdin = FakeStdin()
+        self.stdout = BurstyFakeStdout(chunks, gap)
+
+
+async def test_shell_stops_a_continuous_refresher(monkeypatch):
+    """`diagnose sys top` emits a frame forever and never returns a prompt, so
+    the read used to run to command_timeout and the caller's request timed out.
+    It is stopped once the bound passes, and the captured frames are returned."""
+    from dataclasses import replace
+
+    import ssh_mcp.shell as shell_mod
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    monkeypatch.setattr(shell_mod, "_STREAM_GAP", 0.05)
+    profile = replace(SHELL_PROFILES["fortios"], stream_bound=0.25, quiet=5.0)
+    proc = BurstyFakeProcess(
+        ["fgt1-p # diagnose sys top\r\n", "frame1\r\n", "frame2\r\n", "frame3\r\n"], gap=0.1
+    )
+    conn = ShellConnection(FakeConn(), proc, command_timeout=30.0, profile=profile)
+    resp = await conn.send_command("diagnose sys top")
+
+    assert resp.elapsed_time < 5.0, "should stop at the bound, not the timeout"
+    assert "frame1" in resp.result
+    assert "q" in proc.stdin.writes, "must stop the refresher on the device"
+    assert resp.note is not None and "refreshes continuously" in resp.note
+
+
+async def test_shell_does_not_cut_a_large_continuous_dump(monkeypatch):
+    """The discriminator that matters: a 648KB `show` streams with no idle gaps
+    and ends on a prompt. It must run to completion however long it takes."""
+    from dataclasses import replace
+
+    import ssh_mcp.shell as shell_mod
+    from ssh_mcp.shell import SHELL_PROFILES, ShellConnection
+
+    monkeypatch.setattr(shell_mod, "_STREAM_GAP", 0.05)
+    profile = replace(SHELL_PROFILES["fortios"], stream_bound=0.05, quiet=5.0)
+    chunks = ["fgt1-p # show\r\n"] + [f"line{i}\r\n" for i in range(40)] + ["fgt1-p # "]
+    proc = BurstyFakeProcess(chunks, gap=0.0)  # continuous: no idle gaps
+    conn = ShellConnection(FakeConn(), proc, command_timeout=30.0, profile=profile)
+    resp = await conn.send_command("show")
+
+    assert "q" not in proc.stdin.writes, "a continuous dump must never be stopped"
+    assert "line0" in resp.result and "line39" in resp.result
+    assert resp.note is None
+
+
+def test_only_fortios_bounds_refreshers():
+    from ssh_mcp.shell import SHELL_PROFILES, ShellProfile
+
+    assert ShellProfile().stream_bound is None
+    assert SHELL_PROFILES["aruba-os"].stream_bound is None
+    assert SHELL_PROFILES["fortios"].stream_bound == 6.0

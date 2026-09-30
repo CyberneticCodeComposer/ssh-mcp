@@ -63,7 +63,7 @@ fully green mock-test suite — mocks don't reproduce device behavior.
 
 ## Architecture overview
 
-See `CLAUDE.md` for the full architecture notes. Quick orientation:
+Quick orientation:
 
 - `ssh_mcp/server.py` — thin wiring: FastMCP instance, lifespan, audit
   middleware, resources, transport.

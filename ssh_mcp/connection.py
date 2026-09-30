@@ -5,7 +5,7 @@ legacy SSH-algorithm profile for old gear (Catalyst IOS 12.x, ProCurve), and
 opens connections via the asyncssh transport. Connections are per-call: open,
 run, close — there is no pool.
 
-Design lessons carried from a prior Go SSH collector:
+Design lessons carried from CANS internal/collector/ssh/client.go:
   - legacy CBC ciphers / dh-group1 kex are required by old IOS and ProCurve;
   - host-key verification is opt-in (a known_hosts path) and otherwise off.
 """
@@ -25,9 +25,9 @@ from .hostkeys import (
     make_tofu_client_factory,
     resolve_known_hosts_path,
 )
-from .safety import check_host_allowed, redact
+from .safety import check_host_allowed, normalize_context, redact
 from .settings import CredentialProfile, Settings
-from .shell import ShellConnection, open_shell
+from .shell import SHELL_PROFILES, ShellConnection, open_shell
 
 # --- typed errors ---------------------------------------------------------
 
@@ -70,8 +70,6 @@ _NETWORK_PLATFORMS: dict[str, str] = {
     "juniper-junos": "juniper_junos",
     "aruba-cx": "aruba_aoscx",
     "vyos": "vyos_vyos",
-    "fortios": "fortinet_fortios",
-    "fortinet": "fortinet_fortios",
     "paloalto-panos": "paloalto_panos",
     "huawei-vrp": "huawei_vrp",
 }
@@ -81,7 +79,21 @@ _NETWORK_PLATFORMS: dict[str, str] = {
 # and ArubaOS Mobility Controllers are listed here so is_generic() and the
 # write tool treat them as no-config-mode hosts, but they are actually
 # connected via a raw PTY shell, not scrapli — see _SHELL_PLATFORMS / shell.py.
-_GENERIC_PLATFORMS: set[str] = {"linux", "generic", "aruba-os-switch", "aruba-os"}
+_GENERIC_PLATFORMS: set[str] = {
+    "linux",
+    "generic",
+    "aruba-os-switch",
+    "aruba-os",
+    # FortiOS is driven by the raw PTY shell (see _SHELL_PLATFORMS). It is
+    # listed here so is_generic() is true — it has no scrapli config mode, so
+    # the write tool sends config line by line, which is the right model for
+    # FortiOS's `config x / edit y / set z / next / end` blocks. It is NOT a
+    # Unix host, so is_unix_host() stays false and it gets the denylist plus
+    # the FortiOS command policy rather than the Unix allowlist.
+    "fortios",
+    "fortinet",
+    "fortigate",
+}
 
 # Platforms whose SSH stacks need legacy ciphers / key exchange / host-key algs.
 _LEGACY_PLATFORMS: set[str] = {"cisco-ios", "cisco-iosxe", "aruba-os-switch"}
@@ -95,14 +107,15 @@ _LEGACY_PLATFORMS: set[str] = {"cisco-ios", "cisco-iosxe", "aruba-os-switch"}
 # disables paging, and reads by quiet-time detection. These slugs stay in
 # _GENERIC_PLATFORMS too, so is_generic() / SUPPORTED_PLATFORMS / the write
 # tool keep treating them as no-config-mode hosts.
-_SHELL_PLATFORMS: set[str] = {"aruba-os-switch", "aruba-os"}
+# Derived from shell.SHELL_PROFILES so a shell platform is declared once.
+_SHELL_PLATFORMS: set[str] = set(SHELL_PROFILES)
 
 # Pager-disable command for each shell platform, sent once after the banner
 # drain so long `show` output is not chopped at a "-- MORE --" prompt.
-_PAGING_COMMANDS: dict[str, str] = {
-    "aruba-os-switch": "no page",  # ProCurve / ArubaOS-Switch
-    "aruba-os": "no paging",  # ArubaOS Mobility Controller / Conductor
-}
+# Derived view of each shell platform's pager-disable command. FortiOS's is
+# empty on purpose: its only persistent pager-off is a config WRITE, so that
+# platform answers the interactive `--More--` prompt instead.
+_PAGING_COMMANDS: dict[str, str] = {s: p.paging_command for s, p in SHELL_PROFILES.items()}
 
 # Exec-mode command that persists running-config to startup, by slug. Used by
 # the write tool's optional `save` flag. Junos / IOS-XR / PAN-OS persist via
@@ -136,6 +149,41 @@ def normalize_platform(platform: str) -> str:
 
 def is_generic(platform: str) -> bool:
     return normalize_platform(platform) in _GENERIC_PLATFORMS
+
+
+# Real Unix shells with an arbitrary command surface. The read tools apply the
+# positive allowlist (safety.check_read_only(..., unix_host=True)) to these —
+# NOT to the ArubaOS-Switch / ArubaOS banner shells, which are in
+# _GENERIC_PLATFORMS but only understand `show`-style network CLI and so use
+# the denylist like other network gear.
+_UNIX_PLATFORMS: set[str] = {"linux", "generic"}
+
+
+def is_unix_host(platform: str) -> bool:
+    return normalize_platform(platform) in _UNIX_PLATFORMS
+
+
+# Platform slug -> safety.check_read_only() policy name. A policy inverts the
+# denylist for a device family whose state-changing verbs hide behind a benign
+# lead token; see safety._POLICIES.
+_COMMAND_POLICIES: dict[str, str] = {
+    "fortios": "fortios",
+    "fortinet": "fortios",
+    "fortigate": "fortios",
+}
+
+
+def command_policy(platform: str | None) -> str | None:
+    """The per-platform read policy name for a slug, or None."""
+    if not platform:
+        return None
+    return _COMMAND_POLICIES.get(normalize_platform(platform))
+
+
+def supports_context(platform: str) -> bool:
+    """Whether the platform has device contexts (FortiOS VDOM / global)."""
+    profile = SHELL_PROFILES.get(normalize_platform(platform))
+    return bool(profile and profile.supports_context)
 
 
 def _resolve_key_path(profile: CredentialProfile) -> str:
@@ -227,14 +275,120 @@ def _build_driver(
     if slug in _NETWORK_PLATFORMS:
         from scrapli import AsyncScrapli
 
+        scrapli_platform = _NETWORK_PLATFORMS[slug]
         if profile.enable_secret:
-            common["auth_secondary"] = profile.enable_secret
-        return AsyncScrapli(platform=_NETWORK_PLATFORMS[slug], **common)
+            try:
+                return AsyncScrapli(
+                    platform=scrapli_platform, auth_secondary=profile.enable_secret, **common
+                )
+            except TypeError as exc:
+                # Some scrapli-community platforms ship a driver subclassed from
+                # AsyncGenericDriver, which has no privilege-escalation concept
+                # and therefore no `auth_secondary` parameter. Passing it is a
+                # hard construction failure before a single packet is sent —
+                # every call to such a device failed 100% of the time whenever
+                # the credential profile carried an enable secret. Match on the
+                # message so an unrelated TypeError still surfaces.
+                if "auth_secondary" not in str(exc):
+                    raise
+        return AsyncScrapli(platform=scrapli_platform, **common)
 
     raise UnsupportedPlatformError(
         f"Unsupported platform {platform!r}. Supported platform slugs: "
         f"{', '.join(SUPPORTED_PLATFORMS)}. Use 'linux' for generic Unix hosts."
     )
+
+
+def validate_platform(platform: str) -> str:
+    """Return the normalised slug, or raise UnsupportedPlatformError."""
+    slug = normalize_platform(platform)
+    if slug not in _NETWORK_PLATFORMS and slug not in _GENERIC_PLATFORMS:
+        raise UnsupportedPlatformError(
+            f"Unsupported platform {platform!r}. Supported platform slugs: "
+            f"{', '.join(SUPPORTED_PLATFORMS)}. Use 'linux' for generic Unix hosts."
+        )
+    return slug
+
+
+def _translate_asyncssh_error(
+    exc: Exception, host: str, port: int, slug: str, profile: CredentialProfile
+) -> SSHError:
+    """Map an asyncssh failure onto the typed SSH errors."""
+    if isinstance(exc, asyncssh.PermissionDenied):
+        return SSHAuthError(
+            f"SSH authentication failed for {host} (profile {profile.name!r}): "
+            f"{exc}. Verify the username/password or key for this credential "
+            f"profile, then retry."
+        )
+    return SSHConnectError(
+        f"Could not connect to {host}:{port} as platform {slug!r}: {exc}. "
+        f"Common causes: host unreachable, SSH not listening, or an "
+        f"algorithm mismatch with very old gear. Try ssh_check_reachable "
+        f"first, and confirm the platform slug."
+    )
+
+
+async def probe_reachable(
+    host: str,
+    platform: str,
+    profile: CredentialProfile,
+    settings: Settings,
+    port: int = 22,
+) -> None:
+    """Open and immediately close a bare SSH session — no PTY, no shell, no
+    prompt detection, no commands.
+
+    Reachability is a transport + authentication question, so it is answered
+    with asyncssh directly. Routing it through a platform driver made the
+    answer depend on whether the driver could match the device's prompt: a
+    healthy, credential-accepting FortiGate reported reachable=False because
+    the generic driver's prompt pattern cannot span the space in
+    "fgt1-p # ". `platform` still selects legacy algorithms for old gear,
+    and an unknown slug is still an error."""
+    slug = validate_platform(platform)
+    denied = check_host_allowed(host, settings.allowed_hosts)
+    if denied:
+        raise ToolError(denied)
+
+    client_keys = [_resolve_key_path(profile)] if profile.private_key else None
+    opts = _asyncssh_connect_opts(slug, profile, settings)
+    try:
+        conn = await asyncssh.connect(
+            host,
+            port=port,
+            username=profile.username,
+            password=profile.password or None,
+            client_keys=client_keys or None,
+            connect_timeout=settings.timeout_socket,
+            **opts,
+        )
+    except (TimeoutError, asyncssh.Error, OSError) as exc:
+        raise _translate_asyncssh_error(exc, host, port, slug, profile) from exc
+    conn.close()
+    with suppress(Exception):
+        await conn.wait_closed()
+
+
+async def enter_context(driver: object, context: str | None) -> str | None:
+    """Navigate an open connection into a device context (a FortiOS VDOM, or
+    `global`). A no-op when `context` is None.
+
+    Raises a recovery-oriented ToolError when the platform has no context
+    concept, so the tool layer stays platform-agnostic."""
+    # Normalize here too, not only at the tool boundary: this is the single
+    # gate in front of every driver's context navigation, so a blank or
+    # placeholder value can never reach `config vdom` / `edit <name>` however
+    # it arrived.
+    context = normalize_context(context)
+    if not context:
+        return None
+    fn = getattr(driver, "enter_context", None)
+    if fn is None:
+        raise ToolError(
+            "The `vdom` parameter is only supported on FortiOS platforms "
+            "('fortios', 'fortinet', 'fortigate'). Omit it for this platform."
+        )
+    return await fn(context)
 
 
 async def _open_raw_shell(
@@ -259,21 +413,10 @@ async def _open_raw_shell(
             asyncssh_opts=asyncssh_opts,
             connect_timeout=settings.timeout_socket,
             command_timeout=command_timeout,
-            paging_command=_PAGING_COMMANDS.get(slug, "no page"),
+            profile=SHELL_PROFILES.get(slug),
         )
-    except asyncssh.PermissionDenied as exc:
-        raise SSHAuthError(
-            f"SSH authentication failed for {host} (profile {profile.name!r}): "
-            f"{exc}. Verify the username/password or key for this credential "
-            f"profile, then retry."
-        ) from exc
     except (TimeoutError, asyncssh.Error, OSError) as exc:
-        raise SSHConnectError(
-            f"Could not connect to {host}:{port} as platform {slug!r}: {exc}. "
-            f"Common causes: host unreachable, SSH not listening, or an "
-            f"algorithm mismatch with very old gear. Try ssh_check_reachable "
-            f"first, and confirm the platform slug."
-        ) from exc
+        raise _translate_asyncssh_error(exc, host, port, slug, profile) from exc
 
 
 @asynccontextmanager
@@ -284,6 +427,7 @@ async def open_connection(
     settings: Settings,
     port: int = 22,
     timeout_ops: float | None = None,
+    context: str | None = None,
 ) -> AsyncIterator[object]:
     """Open an SSH connection, yield the driver, and always close it.
 
@@ -304,6 +448,7 @@ async def open_connection(
     if slug in _SHELL_PLATFORMS:
         shell = await _open_raw_shell(host, slug, profile, settings, port, ops_timeout)
         try:
+            await enter_context(shell, context)
             yield shell
         finally:
             # Close failures must not mask the call's result.
@@ -341,6 +486,7 @@ async def open_connection(
         ) from exc
 
     try:
+        await enter_context(driver, context)
         yield driver
     finally:
         # Close failures must not mask the call's result.
@@ -376,6 +522,16 @@ async def execute_configs(driver: object, commands: list[str]):
     try:
         multi = await driver.send_configs(commands, stop_on_failed=True)  # type: ignore[attr-defined]
         return list(multi)
+    except NotImplementedError as exc:
+        # Some scrapli drivers (fortinet_fortios) do not implement config-mode
+        # apply at all. Such platforms must send config line by line — i.e. the
+        # slug belongs in _GENERIC_PLATFORMS so the write tool takes the
+        # sequential branch. Surface it as a typed error, not a raw exception.
+        raise SSHCommandError(
+            f"This platform's driver does not implement config-mode apply "
+            f"({exc}). Configuration must be sent line by line on this "
+            f"platform — the slug is missing from _GENERIC_PLATFORMS."
+        ) from exc
     except (TimeoutError, ScrapliException, OSError) as exc:
         raise SSHCommandError(
             f"SSH session failed while applying configuration: "
